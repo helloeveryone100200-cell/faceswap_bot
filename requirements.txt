@@ -1,6 +1,6 @@
 aiogram==3.13.1
 motor==3.6.0
-pymongo==4.10.1
+pymongo>=4.9,<4.10
 gradio_client==1.4.2
 python-dotenv==1.0.1
 aiofiles==24.1.0
