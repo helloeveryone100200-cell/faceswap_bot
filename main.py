@@ -4,6 +4,8 @@ import os
 import tempfile
 from datetime import datetime
 
+from aiohttp import web
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -443,7 +445,23 @@ async def handle_unsolicited_video(message: Message, state: FSMContext) -> None:
     )
 
 
-async def main() -> None:
+async def health_handler(request: web.Request) -> web.Response:
+    return web.Response(text="Bot is running! ✅")
+
+
+async def run_web_server() -> None:
+    port = int(os.environ.get("PORT", 10000))
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Health check server listening on port %d", port)
+    await asyncio.Event().wait()
+
+
+async def run_bot() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable is not set!")
     if not ADMIN_ID:
@@ -458,6 +476,10 @@ async def main() -> None:
 
     logger.info("Bot is starting...")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+
+
+async def main() -> None:
+    await asyncio.gather(run_web_server(), run_bot())
 
 
 if __name__ == "__main__":
