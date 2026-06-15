@@ -3,216 +3,124 @@ from datetime import datetime, timezone
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from config import ALIASES, DB_NAME, MAX_USERS_PER_ROOM, MONGO_URI
+from config import ALIASES, MAX_USERS_PER_ROOM, MONGO_URL
 
-client = AsyncIOMotorClient(MONGO_URI)
-db = client[DB_NAME]
-users_col = db["u"]
-rooms_col = db["r"]
+_client: AsyncIOMotorClient | None = None
 
 
-async def setup_indexes() -> None:
-    await users_col.create_index("r_id")
-    await users_col.create_index("s")
-    await rooms_col.create_index("c")
+def get_db():
+    global _client
+    if _client is None:
+        _client = AsyncIOMotorClient(MONGO_URL)
+    return _client["anon_chat"]
 
 
-# ─── User ─────────────────────────────────────────────────────────────────────
-
-async def get_or_create_user(user_id: int, username: str | None) -> dict:
-    now = datetime.now(timezone.utc)
-    alias = random.choice(ALIASES)
-    update: dict = {
-        "$setOnInsert": {"j": now, "s": 1, "r_id": None, "n": alias, "req": []},
-    }
-    if username:
-        update["$set"] = {"u": username}
-    doc = await users_col.find_one_and_update(
-        {"_id": user_id},
-        update,
-        upsert=True,
-        return_document=True,
-    )
-    return doc
-
+# ---------------------------------------------------------------------------
+# User helpers
+# ---------------------------------------------------------------------------
 
 async def get_user(user_id: int) -> dict | None:
-    return await users_col.find_one({"_id": user_id})
+    return await get_db()["u"].find_one({"_id": user_id})
+
+
+async def get_or_create_user(user_id: int, username: str | None) -> dict:
+    db = get_db()
+    user = await db["u"].find_one({"_id": user_id})
+    if user:
+        return user
+
+    used = await db["u"].distinct("n")
+    available = [a for a in ALIASES if a not in used]
+    alias = random.choice(available) if available else random.choice(ALIASES)
+
+    user = {
+        "_id": user_id,
+        "u": username,
+        "n": alias,
+        "r_id": None,
+        "s": 1,
+        "j": datetime.now(timezone.utc),
+    }
+    await db["u"].insert_one(user)
+    return user
+
+
+async def set_user_room(user_id: int, room_id: str | None) -> None:
+    await get_db()["u"].update_one({"_id": user_id}, {"$set": {"r_id": room_id}})
 
 
 async def ban_user(user_id: int) -> None:
-    room_id = await leave_room(user_id)
-    await users_col.update_one({"_id": user_id}, {"$set": {"s": 0}})
-    return room_id
+    await get_db()["u"].update_one({"_id": user_id}, {"$set": {"s": 0}})
 
 
 async def unban_user(user_id: int) -> None:
-    await users_col.update_one({"_id": user_id}, {"$set": {"s": 1}})
+    await get_db()["u"].update_one({"_id": user_id}, {"$set": {"s": 1}})
 
 
-# ─── Rooms ───────────────────────────────────────────────────────────────────
+async def count_users() -> int:
+    return await get_db()["u"].count_documents({})
 
-async def join_room(user_id: int) -> str:
-    room = await rooms_col.find_one({"c": {"$lt": MAX_USERS_PER_ROOM}}, sort=[("_id", 1)])
 
-    if room:
-        room_id: str = room["_id"]
-    else:
-        count = await rooms_col.count_documents({})
-        room_id = f"room_{count + 1}"
-        await rooms_col.insert_one({"_id": room_id, "u_ids": [], "c": 0})
+async def count_banned() -> int:
+    return await get_db()["u"].count_documents({"s": 0})
 
-    await rooms_col.update_one(
+
+async def count_active_chatters() -> int:
+    return await get_db()["u"].count_documents({"r_id": {"$ne": None}, "s": 1})
+
+
+async def get_all_active_users() -> list[dict]:
+    cursor = get_db()["u"].find({"s": 1})
+    return await cursor.to_list(length=None)
+
+
+# ---------------------------------------------------------------------------
+# Room helpers
+# ---------------------------------------------------------------------------
+
+async def get_or_assign_room(user_id: int) -> str:
+    db = get_db()
+
+    cursor = db["r"].find().sort("_id", 1)
+    rooms = await cursor.to_list(length=None)
+
+    target_room = None
+    for room in rooms:
+        if room["c"] < MAX_USERS_PER_ROOM:
+            target_room = room
+            break
+
+    if target_room is None:
+        next_num = (len(rooms) + 1) if rooms else 1
+        room_id = f"room_{next_num}"
+        await db["r"].insert_one({"_id": room_id, "u_ids": [user_id], "c": 1})
+        return room_id
+
+    room_id = target_room["_id"]
+    await db["r"].update_one(
         {"_id": room_id},
         {"$addToSet": {"u_ids": user_id}, "$inc": {"c": 1}},
     )
-    await users_col.update_one({"_id": user_id}, {"$set": {"r_id": room_id}})
     return room_id
 
 
-async def leave_room(user_id: int) -> str | None:
-    user = await users_col.find_one({"_id": user_id}, {"r_id": 1})
-    if not user or not user.get("r_id"):
-        return None
-    room_id: str = user["r_id"]
-
-    result = await rooms_col.find_one_and_update(
+async def remove_user_from_room(user_id: int, room_id: str) -> None:
+    db = get_db()
+    await db["r"].update_one(
         {"_id": room_id},
         {"$pull": {"u_ids": user_id}, "$inc": {"c": -1}},
-        return_document=True,
     )
-    if result and result.get("c", 1) <= 0:
-        await rooms_col.delete_one({"_id": room_id})
-
-    await users_col.update_one(
-        {"_id": user_id},
-        {"$set": {"r_id": None}, "$set": {"r_id": None}},
-    )
-    await users_col.update_one({"_id": user_id}, {"$set": {"r_id": None}})
-    return room_id
+    remaining = await db["r"].find_one({"_id": room_id})
+    if remaining and remaining["c"] <= 0:
+        await db["r"].delete_one({"_id": room_id})
 
 
-async def get_room_members(room_id: str, exclude_user_id: int | None = None) -> list[int]:
-    room = await rooms_col.find_one({"_id": room_id}, {"u_ids": 1})
+async def get_room_members(room_id: str) -> list[int]:
+    room = await get_db()["r"].find_one({"_id": room_id})
     if not room:
         return []
-    ids = room.get("u_ids", [])
-    return [uid for uid in ids if uid != exclude_user_id] if exclude_user_id else ids
+    return room.get("u_ids", [])
 
 
-async def get_room_member_count(room_id: str) -> int:
-    room = await rooms_col.find_one({"_id": room_id}, {"c": 1})
-    return room.get("c", 0) if room else 0
-
-
-# ─── Mutual Reveal ───────────────────────────────────────────────────────────
-
-async def request_reveal(user_id: int, room_id: str) -> int | None:
-    """
-    Adds all room members to user's req list.
-    Returns matched user_id if someone already had user_id in their req, else None.
-    """
-    members = await get_room_members(room_id, exclude_user_id=user_id)
-    if not members:
-        return None
-
-    existing = await users_col.find_one(
-        {"_id": {"$in": members}, "req": user_id},
-        {"_id": 1},
-    )
-
-    if existing:
-        matched_uid: int = existing["_id"]
-        await users_col.update_one({"_id": matched_uid}, {"$pull": {"req": user_id}})
-        await users_col.update_one({"_id": user_id}, {"$pull": {"req": matched_uid}})
-        return matched_uid
-
-    await users_col.update_one(
-        {"_id": user_id},
-        {"$addToSet": {"req": {"$each": members}}},
-    )
-    return None
-
-
-# ─── Stats ────────────────────────────────────────────────────────────────────
-
-async def get_stats() -> dict:
-    total = await users_col.count_documents({})
-    banned = await users_col.count_documents({"s": 0})
-    in_chat = await users_col.count_documents({"r_id": {"$ne": None}, "s": 1})
-    active_rooms = await rooms_col.count_documents({"c": {"$gt": 0}})
-    return {
-        "total": total,
-        "banned": banned,
-        "active": total - banned,
-        "in_chat": in_chat,
-        "active_rooms": active_rooms,
-    }
-
-
-async def get_active_user_ids() -> list[int]:
-    cursor = users_col.find({"s": 1}, {"_id": 1})
-    return [doc["_id"] async for doc in cursor]
-
-
-async def get_all_users() -> list[dict]:
-    return await users_col.find(
-        {}, {"_id": 1, "u": 1, "n": 1, "j": 1, "s": 1, "r_id": 1}
-    ).sort("j", -1).to_list(None)
-
-
-async def set_user_alias(user_id: int, new_alias: str) -> str:
-    """
-    Updates user's anonymous alias.
-    Returns 'ok' on success, 'conflict' if another member in same room uses that name.
-    """
-    user = await users_col.find_one({"_id": user_id}, {"r_id": 1})
-    room_id = user.get("r_id") if user else None
-    if room_id:
-        conflict = await users_col.find_one(
-            {"_id": {"$ne": user_id}, "r_id": room_id, "n": new_alias}
-        )
-        if conflict:
-            return "conflict"
-    await users_col.update_one({"_id": user_id}, {"$set": {"n": new_alias}})
-    return "ok"
-
-
-async def get_user_by_alias_in_room(alias: str, room_id: str) -> dict | None:
-    room = await rooms_col.find_one({"_id": room_id}, {"u_ids": 1})
-    if not room:
-        return None
-    members = room.get("u_ids", [])
-    return await users_col.find_one({"_id": {"$in": members}, "n": alias})
-
-
-async def get_active_rooms() -> list[dict]:
-    rooms = await rooms_col.find({"c": {"$gt": 0}}).to_list(None)
-    result = []
-    for room in rooms:
-        members = await users_col.find(
-            {"_id": {"$in": room.get("u_ids", [])}}, {"_id": 1, "n": 1}
-        ).to_list(None)
-        result.append({
-            "_id": room["_id"],
-            "c": room.get("c", 0),
-            "members": members,
-        })
-    return result
-
-
-async def request_reveal_targeted(requester_id: int, target_uid: int) -> bool:
-    """
-    Targeted reveal: requester → target only.
-    Returns True if mutual match (target already had requester in their req).
-    """
-    target_doc = await users_col.find_one({"_id": target_uid}, {"req": 1})
-    if target_doc and requester_id in target_doc.get("req", []):
-        await users_col.update_one({"_id": target_uid}, {"$pull": {"req": requester_id}})
-        await users_col.update_one({"_id": requester_id}, {"$pull": {"req": target_uid}})
-        return True
-    await users_col.update_one(
-        {"_id": requester_id},
-        {"$addToSet": {"req": target_uid}},
-    )
-    return False
+async def count_active_rooms() -> int:
+    return await get_db()["r"].count_documents({})
