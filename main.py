@@ -16,6 +16,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    MessageReactionUpdated,
+    ReactionTypeEmoji,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
@@ -30,9 +32,6 @@ router = Router()
 
 # How long (seconds) system join/leave notifications stay before auto-delete
 NOTIFICATION_TTL = 30
-
-# Reaction emojis shown under every broadcasted message
-REACTIONS: list[str] = ["👍", "❤️", "😂", "😮", "😢", "👏"]
 
 
 # ---------------------------------------------------------------------------
@@ -68,19 +67,6 @@ STRANGER_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=NEXT_TEXT), KeyboardButton(text=STOP_TEXT)]],
     resize_keyboard=True,
 )
-
-
-def build_reaction_kb(msg_key: str, counts: dict) -> InlineKeyboardMarkup:
-    """Build a single-row inline keyboard with emoji reaction buttons + counts."""
-    row = []
-    for emoji in REACTIONS:
-        n = counts.get(emoji, 0)
-        label = f"{emoji} {n}" if n > 0 else emoji
-        row.append(InlineKeyboardButton(
-            text=label,
-            callback_data=f"rx:{msg_key}:{emoji}",
-        ))
-    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 # ---------------------------------------------------------------------------
@@ -153,82 +139,99 @@ async def exit_room(bot: Bot, user_id: int, user_doc: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Media relay — HTML formatting + optional reaction keyboard
+# Native reaction mirror
+#
+# When a user reacts to their copy of a relayed message, we mirror that
+# reaction (via bot.set_message_reaction) to every other copy so all
+# room members see the same reactions on their own copy.
 # ---------------------------------------------------------------------------
 
-async def _relay_message(
-    bot: Bot,
-    to_id: int,
-    alias: str,
-    message: Message,
-    reaction_kb: InlineKeyboardMarkup | None = None,
-) -> Message | None:
-    """
-    Relay a message to one recipient.
-    Returns the sent Message that carries the reaction keyboard (may differ
-    from the label message for sticker/video_note), or None on error.
-    """
+@router.message_reaction()
+async def on_message_reaction(event: MessageReactionUpdated, bot: Bot) -> None:
+    doc = await db.find_msg_by_copy(event.chat.id, event.message_id)
+    if not doc:
+        return
+
+    # Convert to standard emoji reactions only (custom emoji requires premium)
+    reactions: list[ReactionTypeEmoji] = [
+        ReactionTypeEmoji(type="emoji", emoji=r.emoji)
+        for r in event.new_reaction
+        if r.type == "emoji"
+    ]
+
+    # Mirror to all other copies of this message
+    for (copy_chat, copy_msg) in doc["c"]:
+        if copy_chat == event.chat.id and copy_msg == event.message_id:
+            continue  # skip the copy that triggered the reaction
+        try:
+            await bot.set_message_reaction(
+                chat_id=copy_chat,
+                message_id=copy_msg,
+                reaction=reactions,
+            )
+        except Exception as e:
+            log.warning("Reaction mirror failed %s/%s: %s", copy_chat, copy_msg, e)
+
+
+# ---------------------------------------------------------------------------
+# Media relay — HTML formatting, no reaction keyboard (native reactions used)
+# ---------------------------------------------------------------------------
+
+async def _relay_message(bot: Bot, to_id: int, alias: str, message: Message) -> Message | None:
+    """Relay any supported message type. Returns the sent Message or None on error."""
     try:
         if message.text:
             return await bot.send_message(
                 to_id,
                 f"<b>{alias}</b>\n{message.text}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=reaction_kb,
             )
 
         elif message.sticker:
-            # Label (no kb) + sticker (with kb)
             await bot.send_message(
                 to_id, f"<b>{alias}</b> sent a sticker:", parse_mode=ParseMode.HTML
             )
-            return await bot.send_sticker(
-                to_id, message.sticker.file_id, reply_markup=reaction_kb
-            )
+            return await bot.send_sticker(to_id, message.sticker.file_id)
 
         elif message.photo:
             caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b>"
             return await bot.send_photo(
                 to_id, message.photo[-1].file_id,
-                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+                caption=caption, parse_mode=ParseMode.HTML,
             )
 
         elif message.video:
             caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎬"
             return await bot.send_video(
                 to_id, message.video.file_id,
-                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+                caption=caption, parse_mode=ParseMode.HTML,
             )
 
         elif message.video_note:
-            # Label (no kb) + video note (with kb)
             await bot.send_message(
                 to_id, f"<b>{alias}</b> sent a video message:", parse_mode=ParseMode.HTML
             )
-            return await bot.send_video_note(
-                to_id, message.video_note.file_id, reply_markup=reaction_kb
-            )
+            return await bot.send_video_note(to_id, message.video_note.file_id)
 
         elif message.animation:
             caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎞️"
             return await bot.send_animation(
                 to_id, message.animation.file_id,
-                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+                caption=caption, parse_mode=ParseMode.HTML,
             )
 
         elif message.voice:
             return await bot.send_voice(
                 to_id, message.voice.file_id,
                 caption=f"<b>{alias}</b> 🎙️", parse_mode=ParseMode.HTML,
-                reply_markup=reaction_kb,
             )
 
         elif message.audio:
             title = message.audio.title or "audio"
-            caption = f"<b>{alias}</b> 🎵\n<i>{title}</i>"
             return await bot.send_audio(
                 to_id, message.audio.file_id,
-                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+                caption=f"<b>{alias}</b> 🎵\n<i>{title}</i>",
+                parse_mode=ParseMode.HTML,
             )
 
         elif message.document:
@@ -240,7 +243,7 @@ async def _relay_message(
             )
             return await bot.send_document(
                 to_id, message.document.file_id,
-                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+                caption=caption, parse_mode=ParseMode.HTML,
             )
 
         elif message.gift:
@@ -249,7 +252,6 @@ async def _relay_message(
                 to_id,
                 f"🎁 <b>{alias}</b> sent a gift worth <b>{star_count} ⭐</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=reaction_kb,
             )
 
         elif message.paid_media:
@@ -257,7 +259,6 @@ async def _relay_message(
                 to_id,
                 f"💎 <b>{alias}</b> shared paid media.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=reaction_kb,
             )
 
     except Exception as e:
@@ -267,7 +268,7 @@ async def _relay_message(
 
 
 # ---------------------------------------------------------------------------
-# Broadcast to all room members (with reactions)
+# Broadcast to all room members — track copies for reaction mirroring
 # ---------------------------------------------------------------------------
 
 async def _broadcast_to_room(
@@ -278,12 +279,11 @@ async def _broadcast_to_room(
     if not recipients:
         return
 
-    msg_key = _sec.token_urlsafe(6)          # 8-char URL-safe key
-    rx_kb = build_reaction_kb(msg_key, {})   # empty counts initially
-
+    msg_key = _sec.token_urlsafe(6)
     copies: list[list[int]] = []
+
     for mid in recipients:
-        sent = await _relay_message(bot, mid, alias, message, reaction_kb=rx_kb)
+        sent = await _relay_message(bot, mid, alias, message)
         if sent:
             copies.append([mid, sent.message_id])
 
@@ -292,53 +292,16 @@ async def _broadcast_to_room(
 
 
 # ---------------------------------------------------------------------------
-# Send to 1-on-1 stranger partner (with reactions)
+# Send to 1-on-1 stranger — track copy for reaction mirroring
 # ---------------------------------------------------------------------------
 
 async def _send_to_stranger(
     bot: Bot, partner_id: int, alias: str, message: Message
 ) -> None:
     msg_key = _sec.token_urlsafe(6)
-    rx_kb = build_reaction_kb(msg_key, {})
-
-    sent = await _relay_message(bot, partner_id, alias, message, reaction_kb=rx_kb)
+    sent = await _relay_message(bot, partner_id, alias, message)
     if sent:
         await db.create_msg(msg_key, [[partner_id, sent.message_id]])
-
-
-# ---------------------------------------------------------------------------
-# Reaction callback handler
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data.startswith("rx:"))
-async def handle_reaction(cb: CallbackQuery) -> None:
-    parts = cb.data.split(":")
-    if len(parts) != 3:
-        await cb.answer()
-        return
-
-    _, msg_key, emoji = parts
-    result = await db.toggle_reaction(msg_key, cb.from_user.id, emoji)
-
-    if result is None:
-        await cb.answer("⏰ Message expired.", show_alert=False)
-        return
-
-    new_counts, copies = result
-    new_kb = build_reaction_kb(msg_key, new_counts)
-
-    # Update the reaction keyboard on every copy of this message
-    for (chat_id, msg_id) in copies:
-        try:
-            await cb.bot.edit_message_reply_markup(
-                chat_id=chat_id,
-                message_id=msg_id,
-                reply_markup=new_kb,
-            )
-        except Exception:
-            pass
-
-    await cb.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -869,15 +832,13 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Create MongoDB indexes (TTL on msg collection, etc.)
     await db.ensure_indexes()
-
     await dummy_web_server()
 
     log.info("Bot is starting…")
     await dp.start_polling(
         bot,
-        allowed_updates=["message", "callback_query"],
+        allowed_updates=["message", "callback_query", "message_reaction"],
     )
 
 
