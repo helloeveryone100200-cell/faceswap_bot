@@ -199,7 +199,7 @@ async def cmd_setname(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "setname")
 async def cb_setname_btn(cb: CallbackQuery, state: FSMContext) -> None:
-    await cb.answer()
+    await cb.answer("✏️ နာမည်သစ် ရိုက်ထည့်ပြီး ပို့လိုက်ပါ", show_alert=False)
     if not cb.from_user or not cb.message:
         return
     doc = await db.get_user(cb.from_user.id)
