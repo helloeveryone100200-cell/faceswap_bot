@@ -159,3 +159,28 @@ async def get_all_users() -> list[dict]:
     return await users_col.find(
         {}, {"_id": 1, "u": 1, "n": 1, "j": 1, "s": 1, "r_id": 1}
     ).sort("j", -1).to_list(None)
+
+
+async def get_user_by_alias_in_room(alias: str, room_id: str) -> dict | None:
+    room = await rooms_col.find_one({"_id": room_id}, {"u_ids": 1})
+    if not room:
+        return None
+    members = room.get("u_ids", [])
+    return await users_col.find_one({"_id": {"$in": members}, "n": alias})
+
+
+async def request_reveal_targeted(requester_id: int, target_uid: int) -> bool:
+    """
+    Targeted reveal: requester → target only.
+    Returns True if mutual match (target already had requester in their req).
+    """
+    target_doc = await users_col.find_one({"_id": target_uid}, {"req": 1})
+    if target_doc and requester_id in target_doc.get("req", []):
+        await users_col.update_one({"_id": target_uid}, {"$pull": {"req": requester_id}})
+        await users_col.update_one({"_id": requester_id}, {"$pull": {"req": target_uid}})
+        return True
+    await users_col.update_one(
+        {"_id": requester_id},
+        {"$addToSet": {"req": target_uid}},
+    )
+    return False
