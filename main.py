@@ -278,6 +278,65 @@ async def route_media(message: Message) -> None:
 # /admin command
 # ---------------------------------------------------------------------------
 
+PER_PAGE = 15
+
+
+def build_userlist_text(users: list[dict], page: int, total: int) -> str:
+    total_pages = max(1, -(-total // PER_PAGE))
+    lines = [f"👥 *User List* — Page {page + 1}/{total_pages} (Total: {total})\n"]
+    for u in users:
+        status = "🚫" if u["s"] == 0 else ("💬" if u.get("r_id") else "✅")
+        uname = f"@{u['u']}" if u.get("u") else "no username"
+        lines.append(f"{status} *{u['n']}* — {uname} (`{u['_id']}`)")
+    return "\n".join(lines)
+
+
+def build_userlist_kb(page: int, total: int) -> InlineKeyboardMarkup:
+    total_pages = max(1, -(-total // PER_PAGE))
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"ul_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ul_noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"ul_page:{page + 1}"))
+    buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="adm_back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("userlist"))
+async def cmd_userlist(message: Message) -> None:
+    if not is_admin_pm(message):
+        return
+    users, total = await db.get_users_paginated(0, PER_PAGE)
+    await message.answer(
+        build_userlist_text(users, 0, total),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=build_userlist_kb(0, total),
+    )
+
+
+@router.callback_query(F.data.startswith("ul_page:"))
+async def cb_userlist_page(cb: CallbackQuery) -> None:
+    if not is_admin_pm_cb(cb):
+        await cb.answer()
+        return
+    await cb.answer()
+    page = int(cb.data.split(":")[1])
+    users, total = await db.get_users_paginated(page, PER_PAGE)
+    await cb.message.edit_text(
+        build_userlist_text(users, page, total),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=build_userlist_kb(page, total),
+    )
+
+
+@router.callback_query(F.data == "ul_noop")
+async def cb_userlist_noop(cb: CallbackQuery) -> None:
+    await cb.answer()
+
+
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext) -> None:
     if not is_admin_pm(message):
