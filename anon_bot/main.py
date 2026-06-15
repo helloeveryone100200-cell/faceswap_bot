@@ -41,6 +41,10 @@ class AdminFSM(StatesGroup):
     unban = State()
 
 
+class UserFSM(StatesGroup):
+    setname = State()
+
+
 # ─── Keyboards ───────────────────────────────────────────────────────────────
 
 def kb_main_menu() -> InlineKeyboardMarkup:
@@ -55,6 +59,15 @@ def kb_in_room(room_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❤️ အကောင့်ချင်းချိတ်ရန်", callback_data=f"reveal:{room_id}"),
             InlineKeyboardButton(text="🔕 ထွက်ရန်", callback_data=f"leave:{room_id}"),
         ],
+        [
+            InlineKeyboardButton(text="✏️ နာမည်ပြောင်းရန်", callback_data="setname"),
+        ],
+    ])
+
+
+def kb_cancel_setname() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ မလုပ်တော့ပါ", callback_data="cancel_setname")],
     ])
 
 
@@ -82,6 +95,13 @@ def is_admin(user_id: int) -> bool:
 
 def is_private(message: Message) -> bool:
     return message.chat.type == "private"
+
+
+# ─── Name validation ─────────────────────────────────────────────────────────
+
+NAME_MIN = 2
+NAME_MAX = 30
+NAME_FORBIDDEN_RE = re.compile(r"[`*_\[\]()~>#+=|{}.!\\]")
 
 
 # ─── Broadcast helper ────────────────────────────────────────────────────────
@@ -125,6 +145,132 @@ async def broadcast_to_room(bot: Bot, room_id: str, sender_id: int, alias: str, 
                 await bot.send_message(uid, f"*\\[{alias}\\]* 🃏", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
         except Exception as e:
             logger.warning("Room broadcast failed → %d: %s", uid, e)
+
+
+# ─── /setname ────────────────────────────────────────────────────────────────
+
+@router.message(Command("setname"))
+async def cmd_setname(message: Message, state: FSMContext) -> None:
+    if not is_private(message) or not message.from_user:
+        return
+    doc = await db.get_user(message.from_user.id)
+    if not doc:
+        await message.answer("💬 `/start` ရိုက်ပြီး Bot ကို စဖွင့်ပါ", parse_mode=ParseMode.MARKDOWN)
+        return
+    if doc.get("s", 1) == 0:
+        await message.answer("🚫 Ban ကျနေသောကြောင့် ပြောင်းခွင့်မရပါ")
+        return
+    current = doc.get("n", "?")
+    await state.set_state(UserFSM.setname)
+    await message.answer(
+        f"✏️ **Anonymous နာမည် ပြောင်းရန်**\n\n"
+        f"📛 လက်ရှိ နာမည်: **{current}**\n\n"
+        f"🔤 သင်ကြိုက်သော နာမည်သစ်ကို ရိုက်ထည့်ပါ\n"
+        f"_({NAME_MIN}–{NAME_MAX} လုံး · ` * _ [ ] အစရှိသော Special Char မထည့်ပါနှင့်)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb_cancel_setname(),
+    )
+
+
+@router.callback_query(F.data == "setname")
+async def cb_setname_btn(cb: CallbackQuery, state: FSMContext) -> None:
+    if not cb.from_user or not cb.message:
+        await cb.answer()
+        return
+    doc = await db.get_user(cb.from_user.id)
+    if not doc:
+        await cb.answer("Bot ကို /start ဖြင့် စဖွင့်ပါ", show_alert=True)
+        return
+    if doc.get("s", 1) == 0:
+        await cb.answer("🚫 Ban ကျနေသောကြောင့် ပြောင်းခွင့်မရပါ", show_alert=True)
+        return
+    current = doc.get("n", "?")
+    await state.set_state(UserFSM.setname)
+    await cb.message.answer(
+        f"✏️ **Anonymous နာမည် ပြောင်းရန်**\n\n"
+        f"📛 လက်ရှိ နာမည်: **{current}**\n\n"
+        f"🔤 သင်ကြိုက်သော နာမည်သစ်ကို ရိုက်ထည့်ပါ\n"
+        f"_({NAME_MIN}–{NAME_MAX} လုံး · ` * _ [ ] အစရှိသော Special Char မထည့်ပါနှင့်)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb_cancel_setname(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "cancel_setname")
+async def cb_cancel_setname(cb: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if cb.message:
+        await cb.message.edit_text("❌ နာမည်ပြောင်းမှု မလုပ်တော့ပါ")
+    await cb.answer()
+
+
+@router.message(UserFSM.setname, F.text & F.chat.type == "private")
+async def handle_setname_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    raw = (message.text or "").strip()
+
+    if len(raw) < NAME_MIN:
+        await message.answer(
+            f"⚠️ နာမည် အနည်းဆုံး **{NAME_MIN}** လုံး ရှိရမည်\nထပ်ကြိုးစားပါ",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_cancel_setname(),
+        )
+        return
+    if len(raw) > NAME_MAX:
+        await message.answer(
+            f"⚠️ နာမည် အများဆုံး **{NAME_MAX}** လုံးသာ ဖြစ်ရမည်\nထပ်ကြိုးစားပါ",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_cancel_setname(),
+        )
+        return
+    if NAME_FORBIDDEN_RE.search(raw):
+        await message.answer(
+            "⚠️ ` * _ [ ] ( ) # > = | { } ! \\ ကဲ့သို့ Special Character များ မထည့်ပါနှင့်\n"
+            "ထပ်ကြိုးစားပါ",
+            reply_markup=kb_cancel_setname(),
+        )
+        return
+
+    doc = await db.get_user(user.id)
+    if not doc:
+        await state.clear()
+        return
+
+    old_alias = doc.get("n", "?")
+    result = await db.set_user_alias(user.id, raw)
+    await state.clear()
+
+    if result == "conflict":
+        await message.answer(
+            f"⚠️ **'{raw}'** — ဤ Room ထဲ တစ်ဦးမှ အသုံးပြုနေပြီဖြစ်သောကြောင့်\n"
+            f"အခြားနာမည်တစ်ခု ရွေးချယ်ပါ\n\n"
+            f"/setname ရိုက်ပြီး ထပ်ကြိုးစားပါ",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await message.answer(
+        f"✅ **နာမည်ပြောင်းလဲပြီးပါပြီ!**\n\n"
+        f"📛 **{old_alias}** → **{raw}**",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    room_id = doc.get("r_id")
+    if room_id:
+        members = await db.get_room_members(room_id, exclude_user_id=user.id)
+        for uid in members:
+            try:
+                await bot.send_message(
+                    uid,
+                    f"🔄 **{old_alias}** — **{raw}** အဖြစ် နာမည်ပြောင်းလိုက်သည်",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
