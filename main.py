@@ -147,6 +147,31 @@ async def broadcast_to_room(bot: Bot, room_id: str, sender_id: int, alias: str, 
             logger.warning("Room broadcast failed → %d: %s", uid, e)
 
 
+# ─── /myname ─────────────────────────────────────────────────────────────────
+
+@router.message(Command("myname"))
+async def cmd_myname(message: Message) -> None:
+    if not is_private(message) or not message.from_user:
+        return
+    doc = await db.get_user(message.from_user.id)
+    if not doc:
+        await message.answer("💬 `/start` ရိုက်ပြီး Bot ကို စဖွင့်ပါ", parse_mode=ParseMode.MARKDOWN)
+        return
+    alias = doc.get("n", "?")
+    room_id = doc.get("r_id")
+    room_line = f"🚪 Room: `{room_id}`" if room_id else "⬜ Room ထဲ မရှိသေးပါ"
+    await message.answer(
+        f"📛 **သင်၏ Anonymous နာမည်**\n\n"
+        f"🏷️ **{alias}**\n"
+        f"{room_line}\n\n"
+        f"_နာမည်ပြောင်းလိုပါက အောက်ပါ ခလုတ်ကို နှိပ်ပါ_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ နာမည်ပြောင်းရန်", callback_data="setname")],
+        ]),
+    )
+
+
 # ─── /setname ────────────────────────────────────────────────────────────────
 
 @router.message(Command("setname"))
