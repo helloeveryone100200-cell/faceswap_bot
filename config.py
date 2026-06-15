@@ -1,27 +1,26 @@
 import os
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN: str = os.environ["BOT_TOKEN"]
+MONGO_URL: str = os.environ["MONGO_URL"]
+
 ADMIN_IDS: list[int] = [
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "0").split(",")
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 ]
-MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-DB_NAME: str = os.getenv("DB_NAME", "anon_chat_bot")
+
 MAX_USERS_PER_ROOM: int = 50
 
 ALIASES: list[str] = [
-    "မြေခွေးလေး 🦊", "ဆင်မလေး 🐘", "ကျားကလေး 🐯", "ဝက်ဝံလေး 🐻",
-    "ဒရယ်လေး 🦌", "ကြောင်မလေး 🐱", "ပြောင်ကလေး 🐇", "ဝက်ကလေး 🐷",
-    "ဖားကလေး 🐸", "ငါးလေး 🐠", "မျောက်ကလေး 🐒", "ခြင်္သေ့ 🦁",
-    "မြင်းကလေး 🐴", "နွားကလေး 🐮", "သိုးကလေး 🐑", "ဒေါင်းပေါင် 🦚",
-    "ပျားကလေး 🐝", "ပိုးမွှားလေး 🦋", "ငှက်ကြည်ခိုး 🦅", "ပွေးကလေး 🐿️",
-    "နှင်းဆီပန်း 🌹", "ကြာပွင့် 🌸", "နေကြာပန်း 🌻", "ကြာဖြူပန်း 🌼",
-    "ကျာပွင့် 🌷", "ဂျပန်ပန်း 🌺", "ပင်လယ်ငါး 🐡", "ဆတ်ကလေး 🐆",
-    "မြင်းကျားကလေး 🦓", "ဖားမြားကလေး 🐊", "ပင်လယ်ကြာ 🦈", "ကျောက်ငှက် 🦉",
-    "ဝါးငှက် 🦜", "ဒိုင်းနိုဆောကလေး 🦕", "ရုနိုဆောကလေး 🦏", "ဆင်ဖြူ 🐘",
-    "ကျားဖြူ 🐅", "ဘဲကလေး 🦆", "ကြက်တောင် 🐧", "ဓနိပင်ဆင် 🦔",
-    "ပင်လယ်ကွမ်း 🦑", "ငုတ်ငှက် 🦢", "ဘီးလူးကလေး 🐙", "နဂါးလေး 🐲",
-    "ယုန်ဖြူ 🐰", "ဝုဲကလေး 🦝", "ဖြူဝက်ဝံ 🐼", "ကိုလာကလေး 🐨",
-    "ကင်္ကရားကလေး 🦘", "ပင်ချိုကလေး 🦩",
+    "Fox 🦊", "Panda 🐼", "Wolf 🐺", "Rose 🌹", "Tiger 🐯", "Owl 🦉",
+    "Deer 🦌", "Bunny 🐰", "Bear 🐻", "Tulip 🌷", "Hawk 🦅", "Lynx 🐆",
+    "Otter 🦦", "Raven 🐦‍⬛", "Lily 🌸", "Crane 🦢", "Viper 🐍", "Koala 🐨",
+    "Peony 🌺", "Bison 🦬", "Coyote 🐺", "Heron 🕊️", "Orchid 💐", "Gecko 🦎",
+    "Sparrow 🐦", "Hyena 🐗", "Lotus 🪷", "Meerkat 🐾", "Flamingo 🦩",
+    "Marigold 🌻", "Jackal 🦌", "Ibis 🦤", "Peregrine 🦅", "Clover 🍀",
+    "Badger 🦡", "Narwhal 🐳", "Wisteria 🌿", "Capybara 🦫", "Egret 🦢",
+    "Dahlia 🌼", "Stoat 🐀", "Kestrel 🦜", "Jasmine 🌾", "Mantis 🦗",
+    "Sunflower 🌻", "Puffin 🐧", "Iris 🪻", "Dingo 🐕", "Macaw 🦜", "Fern 🌿",
 ]
+
+DUMMY_PORT: int = int(os.environ.get("PORT", "10000"))
