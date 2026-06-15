@@ -177,71 +177,29 @@ async def count_waiting() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Message reaction helpers  (collection: 'msg')
+# Message copy tracking  (collection: 'msg')
 #
-# Schema (minimal):
-#   _id : str        — short unique key (8-char URL-safe base64)
-#   c   : [[int,int]] — copies: list of [chat_id, message_id]
-#   r   : dict       — {emoji: count}  (sparse: only non-zero stored)
-#   u   : dict       — {str(user_id): emoji}  (for toggle / one-per-user)
-#   exp : datetime   — TTL field; MongoDB auto-deletes doc after this time
+# Minimal schema — only what's needed for native reaction mirroring:
+#   _id : str          — 8-char URL-safe key
+#   c   : [[int,int]]  — copies: [[chat_id, msg_id], ...]
+#   exp : datetime     — TTL field; MongoDB auto-deletes after MSG_TTL_HOURS
 #
 # TTL index on 'exp' (expireAfterSeconds=0) is created by ensure_indexes().
 # ---------------------------------------------------------------------------
 
 async def create_msg(key: str, copies: list[list[int]]) -> None:
-    """Store a new broadcast message with its recipient (chat_id, msg_id) pairs."""
+    """Store copy locations for a broadcasted message."""
     exp = datetime.now(timezone.utc) + timedelta(hours=MSG_TTL_HOURS)
     await get_db()["msg"].insert_one({
         "_id": key,
-        "c": copies,   # [[chat_id, msg_id], ...]
-        "r": {},       # reaction counts
-        "u": {},       # user → emoji (for toggle)
+        "c": copies,
         "exp": exp,
     })
 
 
-async def toggle_reaction(
-    key: str, user_id: int, emoji: str
-) -> tuple[dict, list[list[int]]] | None:
+async def find_msg_by_copy(chat_id: int, msg_id: int) -> dict | None:
     """
-    Toggle a user's reaction on a message.
-
-    - If user reacts with the same emoji → remove it (toggle off).
-    - If user reacts with a different emoji → switch.
-    - If user has no reaction → add it.
-
-    Returns (reaction_counts, copies) so the caller can update keyboards,
-    or None if the message doc has expired / not found.
+    Find the msg doc that contains the exact copy (chat_id, msg_id).
+    Used to look up sibling copies when a native reaction arrives.
     """
-    db = get_db()
-    doc = await db["msg"].find_one({"_id": key})
-    if not doc:
-        return None
-
-    uid = str(user_id)
-    counts: dict = dict(doc.get("r", {}))
-    users: dict = dict(doc.get("u", {}))
-    prev = users.get(uid)
-
-    if prev == emoji:
-        # Same emoji → remove reaction
-        counts[prev] = counts.get(prev, 1) - 1
-        if counts[prev] <= 0:
-            counts.pop(prev, None)
-        users.pop(uid, None)
-    else:
-        # Remove previous reaction if any
-        if prev:
-            counts[prev] = counts.get(prev, 1) - 1
-            if counts[prev] <= 0:
-                counts.pop(prev, None)
-        # Add new reaction
-        counts[emoji] = counts.get(emoji, 0) + 1
-        users[uid] = emoji
-
-    await db["msg"].update_one(
-        {"_id": key},
-        {"$set": {"r": counts, "u": users}},
-    )
-    return counts, doc["c"]
+    return await get_db()["msg"].find_one({"c": [chat_id, msg_id]})
