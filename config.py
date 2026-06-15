@@ -9,7 +9,7 @@ ADMIN_IDS: list[int] = [
     if x.strip().isdigit()
 ]
 
-MAX_USERS_PER_ROOM: int = 50
+DUMMY_PORT: int = int(os.environ.get("PORT", "10000"))
 
 ALIASES: list[str] = [
     "Fox 🦊", "Panda 🐼", "Wolf 🐺", "Rose 🌹", "Tiger 🐯", "Owl 🦉",
@@ -22,5 +22,3 @@ ALIASES: list[str] = [
     "Dahlia 🌼", "Stoat 🐀", "Kestrel 🦜", "Jasmine 🌾", "Mantis 🦗",
     "Sunflower 🌻", "Puffin 🐧", "Iris 🪻", "Dingo 🐕", "Macaw 🦜", "Fern 🌿",
 ]
-
-DUMMY_PORT: int = int(os.environ.get("PORT", "10000"))
