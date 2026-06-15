@@ -6,7 +6,7 @@ import re
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -199,15 +199,15 @@ async def cmd_setname(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "setname")
 async def cb_setname_btn(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
     if not cb.from_user or not cb.message:
-        await cb.answer()
         return
     doc = await db.get_user(cb.from_user.id)
     if not doc:
-        await cb.answer("Bot ကို /start ဖြင့် စဖွင့်ပါ", show_alert=True)
+        await cb.message.answer("Bot ကို /start ဖြင့် စဖွင့်ပါ")
         return
     if doc.get("s", 1) == 0:
-        await cb.answer("🚫 Ban ကျနေသောကြောင့် ပြောင်းခွင့်မရပါ", show_alert=True)
+        await cb.message.answer("🚫 Ban ကျနေသောကြောင့် ပြောင်းခွင့်မရပါ")
         return
     current = doc.get("n", "?")
     await state.set_state(UserFSM.setname)
@@ -219,7 +219,6 @@ async def cb_setname_btn(cb: CallbackQuery, state: FSMContext) -> None:
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb_cancel_setname(),
     )
-    await cb.answer()
 
 
 @router.callback_query(F.data == "cancel_setname")
@@ -537,7 +536,7 @@ async def _get_active_user(user_id: int, username: str | None) -> dict | None:
     return doc
 
 
-@router.message(F.text & ~F.text.startswith("/") & F.chat.type == "private")
+@router.message(StateFilter(None), F.text & ~F.text.startswith("/") & F.chat.type == "private")
 async def handle_text(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user:
@@ -550,7 +549,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
     await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
 
 
-@router.message(F.photo & F.chat.type == "private")
+@router.message(StateFilter(None), F.photo & F.chat.type == "private")
 async def handle_photo(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user:
@@ -560,7 +559,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
         await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
 
 
-@router.message(F.voice & F.chat.type == "private")
+@router.message(StateFilter(None), F.voice & F.chat.type == "private")
 async def handle_voice(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user:
@@ -570,7 +569,7 @@ async def handle_voice(message: Message, bot: Bot) -> None:
         await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
 
 
-@router.message(F.animation & F.chat.type == "private")
+@router.message(StateFilter(None), F.animation & F.chat.type == "private")
 async def handle_animation(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user:
@@ -580,7 +579,7 @@ async def handle_animation(message: Message, bot: Bot) -> None:
         await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
 
 
-@router.message(F.sticker & F.chat.type == "private")
+@router.message(StateFilter(None), F.sticker & F.chat.type == "private")
 async def handle_sticker(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user:
