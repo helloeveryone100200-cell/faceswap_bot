@@ -32,7 +32,8 @@ router = Router()
 # ---------------------------------------------------------------------------
 
 MAIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💬 Join Anonymous Chat", callback_data="join_chat")]
+    [InlineKeyboardButton(text="💬 Join Anonymous Chat", callback_data="join_chat")],
+    [InlineKeyboardButton(text="🎲 Find Stranger (1-on-1)", callback_data="find_stranger")],
 ])
 
 CHAT_KB = ReplyKeyboardMarkup(
@@ -52,6 +53,13 @@ BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 LEAVE_TEXT = "🔕 Leave Chat Room"
+NEXT_TEXT  = "⏭️ Next Stranger"
+STOP_TEXT  = "🔚 Stop Chat"
+
+STRANGER_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=NEXT_TEXT), KeyboardButton(text=STOP_TEXT)]],
+    resize_keyboard=True,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +127,14 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     )
     if user["s"] == 0:
         await message.answer("🚫 You have been banned from this service.")
+        return
+
+    if user.get("p_id"):
+        await message.answer(
+            "You are in a 1-on-1 stranger chat. Use *🔚 Stop Chat* to exit first.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=STRANGER_KB,
+        )
         return
 
     if user.get("r_id"):
@@ -228,6 +244,140 @@ async def leave_room(message: Message) -> None:
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Stranger chat helpers
+# ---------------------------------------------------------------------------
+
+async def _disconnect_stranger(bot: Bot, user_id: int, partner_id: int, notify_partner: bool = True) -> None:
+    await db.set_partner(user_id, None)
+    await db.set_partner(partner_id, None)
+    if notify_partner:
+        try:
+            await bot.send_message(
+                partner_id,
+                "🔌 Your chat partner has disconnected.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await bot.send_message(partner_id, "Find someone new?", reply_markup=MAIN_MENU_KB)
+        except Exception:
+            pass
+
+
+async def _send_to_stranger(bot: Bot, partner_id: int, alias: str, message: Message) -> None:
+    try:
+        if message.text:
+            await bot.send_message(partner_id, f"*[{alias}]:* {message.text}", parse_mode=ParseMode.MARKDOWN)
+        elif message.photo:
+            caption = f"*[{alias}]:* {message.caption}" if message.caption else f"*[{alias}]*"
+            await bot.send_photo(partner_id, message.photo[-1].file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        elif message.animation:
+            caption = f"*[{alias}]:* {message.caption}" if message.caption else f"*[{alias}]*"
+            await bot.send_animation(partner_id, message.animation.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        elif message.voice:
+            await bot.send_voice(partner_id, message.voice.file_id, caption=f"*[{alias}]* 🎙️", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.warning("Failed to relay to stranger %s: %s", partner_id, e)
+
+
+async def _do_find(bot: Bot, user_id: int, user: dict) -> None:
+    await db.enter_queue(user_id)
+    partner_id = await db.find_and_match(user_id)
+
+    if partner_id is None:
+        waiting = await db.count_waiting()
+        await bot.send_message(
+            user_id,
+            f"🔍 Searching for a stranger… ({waiting} in queue)\n\nUse *🔚 Stop Chat* to cancel.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=STRANGER_KB,
+        )
+        return
+
+    partner = await db.get_user(partner_id)
+    if not partner:
+        await db.leave_queue(user_id)
+        await bot.send_message(user_id, "⚠️ Match error. Please try again.", reply_markup=MAIN_MENU_KB)
+        return
+
+    await db.set_partner(user_id, partner_id)
+    await db.set_partner(partner_id, user_id)
+    await db.leave_queue(user_id)
+
+    await bot.send_message(
+        user_id,
+        f"🎲 Connected with *{partner['n']}*!\n\nSay hi — they don't know who you are. 😊",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=STRANGER_KB,
+    )
+    await bot.send_message(
+        partner_id,
+        f"🎲 Connected with *{user['n']}*!\n\nSay hi — they don't know who you are. 😊",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=STRANGER_KB,
+    )
+
+
+# /find command & callback
+
+@router.message(Command("find"))
+async def cmd_find(message: Message) -> None:
+    user = await db.get_or_create_user(message.from_user.id, message.from_user.username)
+    if user["s"] == 0:
+        await message.answer("🚫 You are banned.")
+        return
+    if user.get("r_id"):
+        await message.answer("⚠️ Leave the group chat room first.", reply_markup=CHAT_KB)
+        return
+    if user.get("p_id"):
+        await message.answer("⚠️ You are already in a 1-on-1 chat.", reply_markup=STRANGER_KB)
+        return
+    await _do_find(message.bot, message.from_user.id, user)
+
+
+@router.callback_query(F.data == "find_stranger")
+async def cb_find_stranger(cb: CallbackQuery) -> None:
+    await cb.answer()
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    if user["s"] == 0:
+        await cb.message.answer("🚫 You are banned.")
+        return
+    if user.get("r_id"):
+        await cb.message.answer("⚠️ Leave the group chat room first.", reply_markup=CHAT_KB)
+        return
+    if user.get("p_id"):
+        await cb.message.answer("⚠️ Already in a 1-on-1 chat.", reply_markup=STRANGER_KB)
+        return
+    await _do_find(cb.bot, cb.from_user.id, user)
+
+
+# ⏭️ Next Stranger
+
+@router.message(F.text == NEXT_TEXT)
+async def next_stranger(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        return
+    if user.get("p_id"):
+        await _disconnect_stranger(message.bot, message.from_user.id, user["p_id"])
+    await db.leave_queue(message.from_user.id)
+    await message.answer("🔄 Looking for a new stranger…", reply_markup=STRANGER_KB)
+    await _do_find(message.bot, message.from_user.id, user)
+
+
+# 🔚 Stop Chat
+
+@router.message(F.text == STOP_TEXT)
+async def stop_stranger(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        return
+    if user.get("p_id"):
+        await _disconnect_stranger(message.bot, message.from_user.id, user["p_id"])
+    await db.leave_queue(message.from_user.id)
+    await message.answer("👋 You have left the stranger chat.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Back to the main menu:", reply_markup=MAIN_MENU_KB)
+
+
 async def _broadcast_to_room(bot: Bot, sender_id: int, room_id: str, alias: str, message: Message) -> None:
     members = await db.get_room_members(room_id)
     for mid in members:
@@ -254,24 +404,26 @@ async def _broadcast_to_room(bot: Bot, sender_id: int, room_id: str, alias: str,
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def route_text(message: Message) -> None:
-    if message.text == LEAVE_TEXT:
+    if message.text in (LEAVE_TEXT, NEXT_TEXT, STOP_TEXT):
         return
     user = await db.get_user(message.from_user.id)
-    if not user or not user.get("r_id"):
+    if not user or user["s"] == 0:
         return
-    if user["s"] == 0:
-        return
-    await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
+    if user.get("p_id"):
+        await _send_to_stranger(message.bot, user["p_id"], user["n"], message)
+    elif user.get("r_id"):
+        await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
 
 
 @router.message(F.photo | F.animation | F.voice)
 async def route_media(message: Message) -> None:
     user = await db.get_user(message.from_user.id)
-    if not user or not user.get("r_id"):
+    if not user or user["s"] == 0:
         return
-    if user["s"] == 0:
-        return
-    await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
+    if user.get("p_id"):
+        await _send_to_stranger(message.bot, user["p_id"], user["n"], message)
+    elif user.get("r_id"):
+        await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
 
 
 # ---------------------------------------------------------------------------
