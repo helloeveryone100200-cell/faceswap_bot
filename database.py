@@ -153,3 +153,9 @@ async def get_stats() -> dict:
 async def get_active_user_ids() -> list[int]:
     cursor = users_col.find({"s": 1}, {"_id": 1})
     return [doc["_id"] async for doc in cursor]
+
+
+async def get_all_users() -> list[dict]:
+    return await users_col.find(
+        {}, {"_id": 1, "u": 1, "n": 1, "j": 1, "s": 1, "r_id": 1}
+    ).sort("j", -1).to_list(None)
