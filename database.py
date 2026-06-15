@@ -132,3 +132,32 @@ async def get_room_members(room_id: str) -> list[int]:
 
 async def count_active_rooms() -> int:
     return await get_db()["r"].count_documents({})
+
+
+# ---------------------------------------------------------------------------
+# Stranger queue helpers  (collection: 'q')
+# ---------------------------------------------------------------------------
+
+async def enter_queue(user_id: int) -> None:
+    await get_db()["q"].update_one(
+        {"_id": user_id},
+        {"$set": {"t": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+
+
+async def leave_queue(user_id: int) -> None:
+    await get_db()["q"].delete_one({"_id": user_id})
+
+
+async def find_and_match(user_id: int) -> int | None:
+    match = await get_db()["q"].find_one_and_delete({"_id": {"$ne": user_id}})
+    return match["_id"] if match else None
+
+
+async def set_partner(user_id: int, partner_id: int | None) -> None:
+    await get_db()["u"].update_one({"_id": user_id}, {"$set": {"p_id": partner_id}})
+
+
+async def count_waiting() -> int:
+    return await get_db()["q"].count_documents({})
