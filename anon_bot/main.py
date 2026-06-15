@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -27,6 +28,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+# Regex to extract alias from forwarded room messages: "[alias] 💬"
+ALIAS_RE = re.compile(r"^\[(.+?)\]")
 
 
 # ─── FSM States ──────────────────────────────────────────────────────────────
@@ -149,6 +153,12 @@ async def cmd_start(message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb_in_room(room_id),
         )
+        if is_admin(user.id):
+            await message.answer(
+                "🛡️ **Admin Control Panel**\n━━━━━━━━━━━━━━━━━━━━\nလုပ်ဆောင်ချက် ရွေးချယ်ပါ ↓",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_admin_panel(),
+            )
         return
 
     await message.answer(
@@ -168,6 +178,12 @@ async def cmd_start(message: Message) -> None:
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb_main_menu(),
     )
+    if is_admin(user.id):
+        await message.answer(
+            "🛡️ **Admin Control Panel**\n━━━━━━━━━━━━━━━━━━━━\nလုပ်ဆောင်ချက် ရွေးချယ်ပါ ↓",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_admin_panel(),
+        )
 
 
 # ─── Join room ───────────────────────────────────────────────────────────────
@@ -265,55 +281,78 @@ async def cb_reveal(cb: CallbackQuery, bot: Bot) -> None:
     alias = doc["n"]
     my_username = f"@{user.username}" if user.username else f"ID: `{user.id}`"
 
-    matched_uid = await db.request_reveal(user.id, room_id)
+    # Extract target alias from the message text: "[alias] 💬\ncontent"
+    msg_text = (cb.message.text or cb.message.caption or "") if cb.message else ""
+    m = ALIAS_RE.match(msg_text)
 
-    if matched_uid:
-        matched_doc = await db.get_user(matched_uid)
-        matched_alias = matched_doc["n"] if matched_doc else "အမည်မသိ"
-        try:
-            matched_chat = await bot.get_chat(matched_uid)
-            matched_username = f"@{matched_chat.username}" if matched_chat.username else f"ID: `{matched_uid}`"
-        except Exception:
-            matched_username = f"ID: `{matched_uid}`"
-
-        celebrate = (
-            "🎊 **MATCH ဖြစ်သွားပါပြီ!** 🎉\n\n"
-            "💫 သင်တို့နှစ်ဦးစလုံး ချိတ်ဆက်လိုကြောင်း ဆန္ဒပြပြီးပါပြီ!\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
+    if not m:
+        # Button was clicked on a non-broadcast message (e.g. welcome/join message)
+        await cb.answer(
+            "💡 ကျေးဇူးပြု၍ သင်ချိတ်ဆက်လိုသော အဖွဲ့ဝင်၏ "
+            "စာတစ်စောင်ပေါ်ရှိ ❤️ ခလုတ်ကို တိုက်ရိုက်နှိပ်ပေးပါဗျာ။",
+            show_alert=True,
         )
+        return
+
+    target_alias = m.group(1)
+
+    if target_alias == alias:
+        await cb.answer("ကိုယ့်ကိုကိုယ် ချိတ်မရပါ 😅", show_alert=True)
+        return
+
+    target = await db.get_user_by_alias_in_room(target_alias, room_id)
+    if not target:
+        await cb.answer(
+            "ထို User ကို ရှာမတွေ့ပါ — Room မှ ထွက်သွားပြီ ဖြစ်နိုင်သည်",
+            show_alert=True,
+        )
+        return
+
+    target_uid: int = target["_id"]
+    matched = await db.request_reveal_targeted(user.id, target_uid)
+
+    celebrate = (
+        "🎊 **MATCH ဖြစ်သွားပါပြီ!** 🎉\n\n"
+        "💫 သင်တို့နှစ်ဦးစလုံး ချိတ်ဆက်လိုကြောင်း ဆန္ဒပြပြီးပါပြီ!\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if matched:
+        target_doc = await db.get_user(target_uid)
+        matched_alias = target_doc["n"] if target_doc else target_alias
+        try:
+            matched_chat = await bot.get_chat(target_uid)
+            matched_username = (
+                f"@{matched_chat.username}" if matched_chat.username else f"ID: `{target_uid}`"
+            )
+        except Exception:
+            matched_username = f"ID: `{target_uid}`"
+
         await bot.send_message(
             user.id,
             celebrate + f"🏷️ **{matched_alias}**\n📲 {matched_username}\n\n💌 Private တွင် ဆက်သွယ်နိုင်ပါပြီ! ✨",
             parse_mode=ParseMode.MARKDOWN,
         )
         await bot.send_message(
-            matched_uid,
+            target_uid,
             celebrate + f"🏷️ **{alias}**\n📲 {my_username}\n\n💌 Private တွင် ဆက်သွယ်နိုင်ပါပြီ! ✨",
             parse_mode=ParseMode.MARKDOWN,
         )
         await cb.answer("🎉 Match ဖြစ်သွားပါပြီ!", show_alert=True)
         return
 
-    members_count = len(await db.get_room_members(room_id, exclude_user_id=user.id))
-    if members_count == 0:
-        await cb.answer("Room ထဲ တစ်ဦးတည်းသာ ရှိသည်", show_alert=True)
-        return
-
-    await cb.answer("❤️ Request ပို့ပြီး! တစ်ဦးဦးမှ ပြန်ဆက်ကြည့်မည်...", show_alert=True)
-
-    members = await db.get_room_members(room_id, exclude_user_id=user.id)
-    for uid in members:
-        try:
-            await bot.send_message(
-                uid,
-                "💌 **Room ထဲမှ တစ်ဦးက သင်နှင့် ချိတ်ဆက်လိုပါသည်!**\n\n"
-                "**'❤️ အကောင့်ချင်းချိတ်ရန်'** နှိပ်ပါ — Match ဖြစ်ပါက\n"
-                "နှစ်ဦးစလုံး Telegram Username ထုတ်ပြပေးမည် 🎊",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_in_room(room_id),
-            )
-        except Exception:
-            pass
+    # Request sent — notify target only
+    await cb.answer(f"❤️ {target_alias} ထံ Request ပို့ပြီး!", show_alert=True)
+    try:
+        await bot.send_message(
+            target_uid,
+            f"💌 **{alias}** က သင်နှင့် ချိတ်ဆက်လိုပါသည်!\n\n"
+            f"သူ၏ စာတစ်စောင်ပေါ်ရှိ **❤️ အကောင့်ချင်းချိတ်ရန်** ခလုတ်ကို နှိပ်ပေးပါ\n"
+            f"Match ဖြစ်ပါက နှစ်ဦးစလုံး Telegram Username ထုတ်ပြပေးမည် 🎊",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
 
 
 # ─── Message forwarding ──────────────────────────────────────────────────────
