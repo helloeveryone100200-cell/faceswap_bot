@@ -74,6 +74,14 @@ async def get_all_active_users() -> list[dict]:
     return await cursor.to_list(length=None)
 
 
+async def get_users_paginated(page: int, per_page: int = 15) -> tuple[list[dict], int]:
+    db = get_db()
+    total = await db["u"].count_documents({})
+    cursor = db["u"].find().sort("j", -1).skip(page * per_page).limit(per_page)
+    users = await cursor.to_list(length=per_page)
+    return users, total
+
+
 # ---------------------------------------------------------------------------
 # Room helpers
 # ---------------------------------------------------------------------------
