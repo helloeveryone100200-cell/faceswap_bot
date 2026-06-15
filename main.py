@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import secrets as _sec
+import time
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -30,21 +31,89 @@ log = logging.getLogger(__name__)
 
 router = Router()
 
-# How long (seconds) system join/leave notifications stay before auto-delete
-NOTIFICATION_TTL = 30
+# ---------------------------------------------------------------------------
+# Rate limiter (anti-spam): 3 seconds between messages per user
+# ---------------------------------------------------------------------------
 
+RATE_LIMIT_SECONDS = 3
+_last_msg_time: dict[int, float] = {}
+
+
+def _is_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+    last = _last_msg_time.get(user_id, 0.0)
+    if now - last < RATE_LIMIT_SECONDS:
+        return True
+    _last_msg_time[user_id] = now
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Bad words filter — Myanmar vulgar/toxic terms
+# Extend this set freely; matching is substring + case-insensitive.
+# ---------------------------------------------------------------------------
+
+BAD_WORDS: set[str] = {
+    "မင်းမေ", "မောက်မ", "အပျော်သမား", "ညစ်ညမ်း",
+    "ဆိုးကောင်", "ပျော်တော်", "ညာကောင်", "ပေါက်ကရ",
+    "ကောင်မနက်", "နက်ကောင်", "အလိုးခံ", "တောင်တုပ်",
+    "မင်းညောင်း", "ပြောင်နေ", "မပိုင်ကောင်", "သားမိုက်",
+    "မိုက်ကောင်", "ဆိပ်ကောင်", "ကြောင်မ", "ကိုင်မ",
+    "fuck", "shit", "bitch", "asshole", "bastard",
+}
+
+
+def _has_bad_words(text: str) -> bool:
+    t = text.lower()
+    return any(w in t for w in BAD_WORDS)
+
+
+# ---------------------------------------------------------------------------
+# Icebreaker questions sent to both users on match
+# ---------------------------------------------------------------------------
+
+ICEBREAKERS: list[str] = [
+    "🍕🍔 What's your all-time favorite food?",
+    "🎬 What movie can you watch over and over again?",
+    "🎵 What song is stuck in your head right now?",
+    "🌏 If you could visit any country tomorrow, where would you go?",
+    "🎮 What's your favorite game to play (mobile, PC, or board)?",
+    "🐾 Do you prefer cats 🐱 or dogs 🐶?",
+    "🌙 Are you a night owl or an early bird?",
+    "📚 Last book or manga/manhwa/webtoon you really enjoyed?",
+    "☕🧋 Coffee or boba tea?",
+    "🦸 If you had one superpower, what would it be?",
+]
 
 # ---------------------------------------------------------------------------
 # Keyboards
 # ---------------------------------------------------------------------------
 
 MAIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💬 Join Anonymous Chat", callback_data="join_chat")],
-    [InlineKeyboardButton(text="🎲 Find Stranger (1-on-1)", callback_data="find_stranger")],
+    [InlineKeyboardButton(text="🔍 Find a Stranger", callback_data="find_stranger")],
+    [InlineKeyboardButton(text="🏷️ My Interests / Tags", callback_data="my_tags")],
 ])
 
-CHAT_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="🔕 Leave Chat Room")]],
+GENDER_SELECT_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="Male 👦", callback_data="gender_m"),
+        InlineKeyboardButton(text="Female 👧", callback_data="gender_f"),
+    ]
+])
+
+TARGET_GENDER_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="Anyone 🌐", callback_data="tg_any")],
+    [
+        InlineKeyboardButton(text="Find Boys 👦", callback_data="tg_m"),
+        InlineKeyboardButton(text="Find Girls 👧", callback_data="tg_f"),
+    ],
+])
+
+STRANGER_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="⏭️ Next Stranger"), KeyboardButton(text="🔚 Stop Chat")],
+        [KeyboardButton(text="🚨 Report Stranger")],
+    ],
     resize_keyboard=True,
 )
 
@@ -59,24 +128,23 @@ BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="adm_back")]
 ])
 
-LEAVE_TEXT = "🔕 Leave Chat Room"
-NEXT_TEXT  = "⏭️ Next Stranger"
-STOP_TEXT  = "🔚 Stop Chat"
-
-STRANGER_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=NEXT_TEXT), KeyboardButton(text=STOP_TEXT)]],
-    resize_keyboard=True,
-)
+NEXT_TEXT   = "⏭️ Next Stranger"
+STOP_TEXT   = "🔚 Stop Chat"
+REPORT_TEXT = "🚨 Report Stranger"
 
 
 # ---------------------------------------------------------------------------
 # FSM States
 # ---------------------------------------------------------------------------
 
+class UserStates(StatesGroup):
+    entering_tags = State()
+
+
 class AdminStates(StatesGroup):
     waiting_broadcast = State()
-    waiting_ban_id = State()
-    waiting_unban_id = State()
+    waiting_ban_id    = State()
+    waiting_unban_id  = State()
 
 
 # ---------------------------------------------------------------------------
@@ -100,329 +168,49 @@ def is_admin_pm_cb(cb: CallbackQuery) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auto-delete helper
+# Stranger connection helpers
 # ---------------------------------------------------------------------------
 
-async def _schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id, message_id)
-    except Exception:
-        pass
+def _gender_label(user: dict) -> str:
+    g = user.get("g")
+    return "👦" if g == "M" else ("👧" if g == "F" else "👤")
 
 
-def _auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int = NOTIFICATION_TTL) -> None:
-    asyncio.create_task(_schedule_delete(bot, chat_id, message_id, delay))
+async def _connect_strangers(bot: Bot, user_a_id: int, user_b_id: int) -> None:
+    """Pair two matched users: set partners, remove from queue, send icebreaker."""
+    await db.leave_queue(user_a_id)
+    await db.leave_queue(user_b_id)
+    await db.set_partner(user_a_id, user_b_id)
+    await db.set_partner(user_b_id, user_a_id)
 
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-async def exit_room(bot: Bot, user_id: int, user_doc: dict) -> None:
-    room_id = user_doc.get("r_id")
-    if room_id:
-        await db.remove_user_from_room(user_id, room_id)
-        await db.set_user_room(user_id, None)
-        members = await db.get_room_members(room_id)
-        for mid in members:
-            if mid != user_id:
-                try:
-                    sent = await bot.send_message(
-                        mid,
-                        f"🔔 <b>{user_doc['n']}</b> has left the chat.",
-                        parse_mode=ParseMode.HTML,
-                    )
-                    _auto_delete(bot, mid, sent.message_id)
-                except Exception:
-                    pass
-
-
-# ---------------------------------------------------------------------------
-# Native reaction mirror
-#
-# When a user reacts to their copy of a relayed message, we mirror that
-# reaction (via bot.set_message_reaction) to every other copy so all
-# room members see the same reactions on their own copy.
-# ---------------------------------------------------------------------------
-
-@router.message_reaction()
-async def on_message_reaction(event: MessageReactionUpdated, bot: Bot) -> None:
-    doc = await db.find_msg_by_copy(event.chat.id, event.message_id)
-    if not doc:
+    user_a = await db.get_user(user_a_id)
+    user_b = await db.get_user(user_b_id)
+    if not user_a or not user_b:
         return
 
-    # Convert to standard emoji reactions only (custom emoji requires premium)
-    reactions: list[ReactionTypeEmoji] = [
-        ReactionTypeEmoji(type="emoji", emoji=r.emoji)
-        for r in event.new_reaction
-        if r.type == "emoji"
-    ]
+    import random
+    icebreaker = random.choice(ICEBREAKERS)
 
-    # Mirror to all other copies of this message
-    for (copy_chat, copy_msg) in doc["c"]:
-        if copy_chat == event.chat.id and copy_msg == event.message_id:
-            continue  # skip the copy that triggered the reaction
-        try:
-            await bot.set_message_reaction(
-                chat_id=copy_chat,
-                message_id=copy_msg,
-                reaction=reactions,
-            )
-        except Exception as e:
-            log.warning("Reaction mirror failed %s/%s: %s", copy_chat, copy_msg, e)
-
-
-# ---------------------------------------------------------------------------
-# Media relay — HTML formatting, no reaction keyboard (native reactions used)
-# ---------------------------------------------------------------------------
-
-async def _relay_message(bot: Bot, to_id: int, alias: str, message: Message) -> Message | None:
-    """Relay any supported message type. Returns the sent Message or None on error."""
-    try:
-        if message.text:
-            return await bot.send_message(
-                to_id,
-                f"<b>{alias}</b>\n{message.text}",
-                parse_mode=ParseMode.HTML,
-            )
-
-        elif message.sticker:
-            await bot.send_message(
-                to_id, f"<b>{alias}</b> sent a sticker:", parse_mode=ParseMode.HTML
-            )
-            return await bot.send_sticker(to_id, message.sticker.file_id)
-
-        elif message.photo:
-            caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b>"
-            return await bot.send_photo(
-                to_id, message.photo[-1].file_id,
-                caption=caption, parse_mode=ParseMode.HTML,
-            )
-
-        elif message.video:
-            caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎬"
-            return await bot.send_video(
-                to_id, message.video.file_id,
-                caption=caption, parse_mode=ParseMode.HTML,
-            )
-
-        elif message.video_note:
-            await bot.send_message(
-                to_id, f"<b>{alias}</b> sent a video message:", parse_mode=ParseMode.HTML
-            )
-            return await bot.send_video_note(to_id, message.video_note.file_id)
-
-        elif message.animation:
-            caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎞️"
-            return await bot.send_animation(
-                to_id, message.animation.file_id,
-                caption=caption, parse_mode=ParseMode.HTML,
-            )
-
-        elif message.voice:
-            return await bot.send_voice(
-                to_id, message.voice.file_id,
-                caption=f"<b>{alias}</b> 🎙️", parse_mode=ParseMode.HTML,
-            )
-
-        elif message.audio:
-            title = message.audio.title or "audio"
-            return await bot.send_audio(
-                to_id, message.audio.file_id,
-                caption=f"<b>{alias}</b> 🎵\n<i>{title}</i>",
-                parse_mode=ParseMode.HTML,
-            )
-
-        elif message.document:
-            fname = message.document.file_name or "file"
-            caption = (
-                f"<b>{alias}</b>\n{message.caption}"
-                if message.caption
-                else f"<b>{alias}</b> 📎\n<i>{fname}</i>"
-            )
-            return await bot.send_document(
-                to_id, message.document.file_id,
-                caption=caption, parse_mode=ParseMode.HTML,
-            )
-
-        elif message.gift:
-            star_count = getattr(message.gift.gift, "star_count", "?")
-            return await bot.send_message(
-                to_id,
-                f"🎁 <b>{alias}</b> sent a gift worth <b>{star_count} ⭐</b>",
-                parse_mode=ParseMode.HTML,
-            )
-
-        elif message.paid_media:
-            return await bot.send_message(
-                to_id,
-                f"💎 <b>{alias}</b> shared paid media.",
-                parse_mode=ParseMode.HTML,
-            )
-
-    except Exception as e:
-        log.warning("Failed to relay to %s: %s", to_id, e)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Broadcast to all room members — track copies for reaction mirroring
-# ---------------------------------------------------------------------------
-
-async def _broadcast_to_room(
-    bot: Bot, sender_id: int, room_id: str, alias: str, message: Message
-) -> None:
-    members = await db.get_room_members(room_id)
-    recipients = [m for m in members if m != sender_id]
-    if not recipients:
-        return
-
-    msg_key = _sec.token_urlsafe(6)
-    copies: list[list[int]] = []
-
-    for mid in recipients:
-        sent = await _relay_message(bot, mid, alias, message)
-        if sent:
-            copies.append([mid, sent.message_id])
-
-    if copies:
-        await db.create_msg(msg_key, copies)
-
-
-# ---------------------------------------------------------------------------
-# Send to 1-on-1 stranger — track copy for reaction mirroring
-# ---------------------------------------------------------------------------
-
-async def _send_to_stranger(
-    bot: Bot, partner_id: int, alias: str, message: Message
-) -> None:
-    msg_key = _sec.token_urlsafe(6)
-    sent = await _relay_message(bot, partner_id, alias, message)
-    if sent:
-        await db.create_msg(msg_key, [[partner_id, sent.message_id]])
-
-
-# ---------------------------------------------------------------------------
-# /start
-# ---------------------------------------------------------------------------
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    user = await db.get_or_create_user(
-        message.from_user.id,
-        message.from_user.username,
+    connected_text = (
+        "🎉 <b>You're connected with a stranger!</b>\n"
+        "Your partner: <b>{name} {icon}</b>\n\n"
+        "🧊 <b>Icebreaker:</b> <i>{ice}</i>\n\n"
+        "Send a message to start chatting!"
     )
-    if user["s"] == 0:
-        await message.answer("🚫 You have been banned from this service.")
-        return
 
-    if user.get("p_id"):
-        await message.answer(
-            "You are in a 1-on-1 stranger chat. Use <b>🔚 Stop Chat</b> to exit first.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=STRANGER_KB,
-        )
-        return
-
-    if user.get("r_id"):
-        await message.answer(
-            "You are currently in a chat room. Use <b>🔕 Leave Chat Room</b> to exit first.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=CHAT_KB,
-        )
-        return
-
-    await message.answer(
-        f"👋 Welcome to <b>Anonymous Chat</b>!\n\nYour alias: <b>{user['n']}</b>\n\nJoin a room to start chatting anonymously.",
+    await bot.send_message(
+        user_a_id,
+        connected_text.format(name=user_b["n"], icon=_gender_label(user_b), ice=icebreaker),
         parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU_KB,
+        reply_markup=STRANGER_KB,
     )
-
-
-# ---------------------------------------------------------------------------
-# Join chat callback
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "join_chat")
-async def cb_join_chat(cb: CallbackQuery) -> None:
-    await cb.answer()
-    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    if user["s"] == 0:
-        await cb.message.answer("🚫 You have been banned from this service.")
-        return
-
-    if user.get("r_id"):
-        await cb.message.answer("You are already in a chat room.", reply_markup=CHAT_KB)
-        return
-
-    room_id = await db.get_or_assign_room(cb.from_user.id)
-    await db.set_user_room(cb.from_user.id, room_id)
-
-    members = await db.get_room_members(room_id)
-    member_count = len(members)
-
-    await cb.message.answer(
-        f"✅ You joined <b>{room_id}</b> as <b>{user['n']}</b>.\n"
-        f"👥 {member_count} user(s) in this room.\n\n"
-        "Say hi — your messages are anonymous!",
+    await bot.send_message(
+        user_b_id,
+        connected_text.format(name=user_a["n"], icon=_gender_label(user_a), ice=icebreaker),
         parse_mode=ParseMode.HTML,
-        reply_markup=CHAT_KB,
+        reply_markup=STRANGER_KB,
     )
 
-    for mid in members:
-        if mid != cb.from_user.id:
-            try:
-                sent = await cb.bot.send_message(
-                    mid,
-                    f"🔔 <b>{user['n']}</b> has joined the chat.",
-                    parse_mode=ParseMode.HTML,
-                )
-                _auto_delete(cb.bot, mid, sent.message_id)
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# Leave room
-# ---------------------------------------------------------------------------
-
-@router.message(F.text == LEAVE_TEXT)
-async def leave_room(message: Message) -> None:
-    user = await db.get_user(message.from_user.id)
-    if not user or not user.get("r_id"):
-        await message.answer("You are not in any chat room.", reply_markup=ReplyKeyboardRemove())
-        await message.answer("Return to the main menu whenever you're ready.", reply_markup=MAIN_MENU_KB)
-        return
-
-    alias = user["n"]
-    room_id = user["r_id"]
-    members = await db.get_room_members(room_id)
-
-    await db.remove_user_from_room(message.from_user.id, room_id)
-    await db.set_user_room(message.from_user.id, None)
-
-    await message.answer("👋 You have left the chat room.", reply_markup=ReplyKeyboardRemove())
-    await message.answer("Want to join again?", reply_markup=MAIN_MENU_KB)
-
-    for mid in members:
-        if mid != message.from_user.id:
-            try:
-                sent = await message.bot.send_message(
-                    mid,
-                    f"🔔 <b>{alias}</b> has left the chat.",
-                    parse_mode=ParseMode.HTML,
-                )
-                _auto_delete(message.bot, mid, sent.message_id)
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# Stranger chat helpers
-# ---------------------------------------------------------------------------
 
 async def _disconnect_stranger(
     bot: Bot, user_id: int, partner_id: int, notify_partner: bool = True
@@ -441,73 +229,494 @@ async def _disconnect_stranger(
             pass
 
 
-async def _do_find(bot: Bot, user_id: int, user: dict) -> None:
-    await db.enter_queue(user_id)
-    partner_id = await db.find_and_match(user_id)
+async def _do_find(bot: Bot, user_id: int, target_gender: str) -> None:
+    """
+    Enter the matchmaking queue and attempt to find a partner.
+    Matching priority:
+      1. Immediate: shared tags + compatible gender
+      2. After 10 s: gender-compatible only (tags relaxed)
+      3. After 30 s more: anyone in queue
+    """
+    user = await db.get_user(user_id)
+    if not user:
+        return
 
-    if partner_id is None:
+    user_gender = user.get("g")
+    user_tags   = user.get("tags", [])
+
+    await db.enter_queue(user_id, user_gender, target_gender, user_tags)
+
+    partner_id = await db.find_and_match(
+        user_id, user_gender, target_gender, user_tags, strict=True
+    )
+    if partner_id:
+        await _connect_strangers(bot, user_id, partner_id)
+        return
+
+    waiting = await db.count_waiting()
+    await bot.send_message(
+        user_id,
+        f"🔍 Searching for a stranger… ({waiting} in queue)\n\n"
+        "Use <b>🔚 Stop Chat</b> to cancel.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=STRANGER_KB,
+    )
+    asyncio.create_task(_fallback_match(bot, user_id))
+
+
+async def _fallback_match(bot: Bot, user_id: int) -> None:
+    """Background task: relax match criteria after delays."""
+    # Phase 2: after 10 s — gender only (no tag requirement)
+    await asyncio.sleep(10)
+    if not await db.is_in_queue(user_id):
+        return
+
+    qe = await db.get_queue_entry(user_id)
+    if not qe:
+        return
+
+    user = await db.get_user(user_id)
+    if not user:
+        return
+
+    partner_id = await db.find_and_match(
+        user_id, user.get("g"), qe.get("tg", "any"), [], strict=False
+    )
+    if partner_id:
+        await _connect_strangers(bot, user_id, partner_id)
+        return
+
+    # Phase 3: after 30 s more — match anyone
+    await asyncio.sleep(30)
+    if not await db.is_in_queue(user_id):
+        return
+
+    partner_id = await db.find_and_match(user_id, None, "any", [], strict=False)
+    if partner_id:
+        await _connect_strangers(bot, user_id, partner_id)
+        return
+
+    # Still nothing — update waiting count in the existing searching message
+    try:
         waiting = await db.count_waiting()
         await bot.send_message(
             user_id,
-            f"🔍 Searching for a stranger… ({waiting} in queue)\n\nUse <b>🔚 Stop Chat</b> to cancel.",
+            f"⏳ Still searching… ({waiting} in queue)\n\n"
+            "Use <b>🔚 Stop Chat</b> to cancel.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Media relay — relays any Telegram message type to a recipient
+# ---------------------------------------------------------------------------
+
+async def _relay_message(
+    bot: Bot,
+    to_id: int,
+    alias: str,
+    message: Message,
+    reply_to_message_id: int | None = None,
+) -> Message | None:
+    """Relay any supported message type. Returns the sent Message or None."""
+    kwargs: dict = {}
+    if reply_to_message_id:
+        kwargs["reply_to_message_id"] = reply_to_message_id
+
+    try:
+        if message.text:
+            return await bot.send_message(
+                to_id,
+                f"<b>{alias}</b>\n{message.text}",
+                parse_mode=ParseMode.HTML,
+                **kwargs,
+            )
+        elif message.sticker:
+            if reply_to_message_id:
+                await bot.send_message(
+                    to_id, f"<b>{alias}</b> sent a sticker:",
+                    parse_mode=ParseMode.HTML, **kwargs
+                )
+            return await bot.send_sticker(to_id, message.sticker.file_id)
+        elif message.photo:
+            cap = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b>"
+            return await bot.send_photo(
+                to_id, message.photo[-1].file_id,
+                caption=cap, parse_mode=ParseMode.HTML, **kwargs,
+            )
+        elif message.video:
+            cap = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎬"
+            return await bot.send_video(
+                to_id, message.video.file_id,
+                caption=cap, parse_mode=ParseMode.HTML, **kwargs,
+            )
+        elif message.video_note:
+            if reply_to_message_id:
+                await bot.send_message(
+                    to_id, f"<b>{alias}</b> sent a video message:",
+                    parse_mode=ParseMode.HTML, **kwargs,
+                )
+            return await bot.send_video_note(to_id, message.video_note.file_id)
+        elif message.animation:
+            cap = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎞️"
+            return await bot.send_animation(
+                to_id, message.animation.file_id,
+                caption=cap, parse_mode=ParseMode.HTML, **kwargs,
+            )
+        elif message.voice:
+            return await bot.send_voice(
+                to_id, message.voice.file_id,
+                caption=f"<b>{alias}</b> 🎙️", parse_mode=ParseMode.HTML, **kwargs,
+            )
+        elif message.audio:
+            title = message.audio.title or "audio"
+            return await bot.send_audio(
+                to_id, message.audio.file_id,
+                caption=f"<b>{alias}</b> 🎵\n<i>{title}</i>",
+                parse_mode=ParseMode.HTML, **kwargs,
+            )
+        elif message.document:
+            fname = message.document.file_name or "file"
+            cap = (
+                f"<b>{alias}</b>\n{message.caption}"
+                if message.caption
+                else f"<b>{alias}</b> 📎\n<i>{fname}</i>"
+            )
+            return await bot.send_document(
+                to_id, message.document.file_id,
+                caption=cap, parse_mode=ParseMode.HTML, **kwargs,
+            )
+        elif message.gift:
+            star_count = getattr(message.gift.gift, "star_count", "?")
+            return await bot.send_message(
+                to_id,
+                f"🎁 <b>{alias}</b> sent a gift worth <b>{star_count} ⭐</b>",
+                parse_mode=ParseMode.HTML, **kwargs,
+            )
+        elif message.paid_media:
+            return await bot.send_message(
+                to_id,
+                f"💎 <b>{alias}</b> shared paid media.",
+                parse_mode=ParseMode.HTML, **kwargs,
+            )
+    except Exception as e:
+        log.warning("Relay to %s failed: %s", to_id, e)
+
+    return None
+
+
+async def _send_to_stranger(
+    bot: Bot,
+    sender_id: int,
+    sender_msg_id: int,
+    partner_id: int,
+    alias: str,
+    message: Message,
+    reply_to_partner_msg_id: int | None = None,
+) -> None:
+    """Relay a message to the stranger and record both message IDs for sync."""
+    msg_key = _sec.token_urlsafe(6)
+    sent = await _relay_message(bot, partner_id, alias, message, reply_to_partner_msg_id)
+    if sent:
+        await db.create_msg(
+            msg_key,
+            [[sender_id, sender_msg_id], [partner_id, sent.message_id]],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Native reaction mirror
+# ---------------------------------------------------------------------------
+
+@router.message_reaction()
+async def on_message_reaction(event: MessageReactionUpdated, bot: Bot) -> None:
+    doc = await db.find_msg_by_copy(event.chat.id, event.message_id)
+    if not doc:
+        return
+
+    reactions: list[ReactionTypeEmoji] = [
+        ReactionTypeEmoji(type="emoji", emoji=r.emoji)
+        for r in event.new_reaction
+        if r.type == "emoji"
+    ]
+
+    for (copy_chat, copy_msg) in doc["c"]:
+        if copy_chat == event.chat.id and copy_msg == event.message_id:
+            continue
+        try:
+            await bot.set_message_reaction(
+                chat_id=copy_chat, message_id=copy_msg, reaction=reactions
+            )
+        except Exception as e:
+            log.warning("Reaction mirror failed %s/%s: %s", copy_chat, copy_msg, e)
+
+
+# ---------------------------------------------------------------------------
+# Edit sync — when a user edits their sent message, mirror to partner's copy
+# ---------------------------------------------------------------------------
+
+@router.edited_message()
+async def on_edited_message(message: Message, bot: Bot) -> None:
+    if not message.from_user or not message.text:
+        return
+
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("p_id"):
+        return
+
+    doc = await db.find_msg_by_copy(message.chat.id, message.message_id)
+    if not doc:
+        return
+
+    alias = user["n"]
+    for (copy_chat, copy_msg) in doc["c"]:
+        if copy_chat == message.chat.id and copy_msg == message.message_id:
+            continue
+        try:
+            await bot.edit_message_text(
+                f"<b>{alias}</b>\n{message.text} ✏️",
+                chat_id=copy_chat,
+                message_id=copy_msg,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            log.warning("Edit sync failed %s/%s: %s", copy_chat, copy_msg, e)
+
+
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user = await db.get_or_create_user(message.from_user.id, message.from_user.username)
+
+    active = await db.lift_expired_temp_ban(message.from_user.id)
+    if not active:
+        user = await db.get_user(message.from_user.id)
+        ban_exp = user.get("ban_exp")
+        if ban_exp:
+            remaining = ban_exp - __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+            hrs = int(remaining.total_seconds() // 3600)
+            mins = int((remaining.total_seconds() % 3600) // 60)
+            await message.answer(
+                f"🚫 You are temporarily banned.\n"
+                f"⏳ Remaining: <b>{hrs}h {mins}m</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.answer("🚫 You have been permanently banned from this service.")
+        return
+
+    if user.get("p_id"):
+        await message.answer(
+            "You are already in a chat. Use <b>🔚 Stop Chat</b> to exit first.",
             parse_mode=ParseMode.HTML,
             reply_markup=STRANGER_KB,
         )
         return
 
-    partner = await db.get_user(partner_id)
-    if not partner:
-        await db.leave_queue(user_id)
-        await bot.send_message(user_id, "⚠️ Match error. Please try again.", reply_markup=MAIN_MENU_KB)
+    # First time: ask gender
+    if not user.get("g"):
+        await message.answer(
+            f"👋 Welcome to <b>Anonymous Chat</b>!\n\n"
+            f"Your alias: <b>{user['n']}</b>\n\n"
+            "First, please select your gender:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=GENDER_SELECT_KB,
+        )
         return
 
-    await db.set_partner(user_id, partner_id)
-    await db.set_partner(partner_id, user_id)
-    await db.leave_queue(user_id)
-
-    await bot.send_message(
-        user_id,
-        f"🎲 Connected with <b>{partner['n']}</b>!\n\nSay hi — they don't know who you are. 😊",
+    await message.answer(
+        f"👋 Welcome back, <b>{user['n']}</b> {_gender_label(user)}!\n\n"
+        "Ready to chat with a stranger?",
         parse_mode=ParseMode.HTML,
-        reply_markup=STRANGER_KB,
-    )
-    await bot.send_message(
-        partner_id,
-        f"🎲 Connected with <b>{user['n']}</b>!\n\nSay hi — they don't know who you are. 😊",
-        parse_mode=ParseMode.HTML,
-        reply_markup=STRANGER_KB,
+        reply_markup=MAIN_MENU_KB,
     )
 
 
-@router.message(Command("find"))
-async def cmd_find(message: Message) -> None:
-    user = await db.get_or_create_user(message.from_user.id, message.from_user.username)
-    if user["s"] == 0:
-        await message.answer("🚫 You are banned.")
-        return
-    if user.get("r_id"):
-        await message.answer("⚠️ Leave the group chat room first.", reply_markup=CHAT_KB)
-        return
-    if user.get("p_id"):
-        await message.answer("⚠️ You are already in a 1-on-1 chat.", reply_markup=STRANGER_KB)
-        return
-    await _do_find(message.bot, message.from_user.id, user)
+# ---------------------------------------------------------------------------
+# Gender selection callbacks
+# ---------------------------------------------------------------------------
 
+@router.callback_query(F.data.in_({"gender_m", "gender_f"}))
+async def cb_set_gender(cb: CallbackQuery) -> None:
+    await cb.answer()
+    gender = "M" if cb.data == "gender_m" else "F"
+    await db.set_gender(cb.from_user.id, gender)
+    user = await db.get_user(cb.from_user.id)
+    icon = "👦" if gender == "M" else "👧"
+    await cb.message.edit_text(
+        f"✅ Gender set to {icon}\n\n"
+        f"Your alias: <b>{user['n']}</b>\n\n"
+        "Ready to chat with a stranger?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU_KB,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tags / interests
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "my_tags")
+async def cb_my_tags(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
+    user = await db.get_user(cb.from_user.id)
+    current = ", ".join(f"#{t}" for t in user.get("tags", [])) if user.get("tags") else "none"
+    await state.set_state(UserStates.entering_tags)
+    await cb.message.answer(
+        f"🏷️ <b>Your current tags:</b> {current}\n\n"
+        "Send up to <b>3 hashtags</b> separated by spaces.\n"
+        "Example: <code>#gaming #movies #kpop</code>\n\n"
+        "These help match you with people who share your interests!",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(UserStates.entering_tags)
+async def handle_tags_input(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not message.text:
+        await message.answer("⚠️ Please send hashtags as text.")
+        return
+
+    raw_tags = [
+        t.lstrip("#").lower().strip()
+        for t in message.text.split()
+        if t.startswith("#") and len(t) > 1
+    ]
+
+    if not raw_tags:
+        await message.answer(
+            "⚠️ No valid hashtags found. Use format: <code>#gaming #movies #kpop</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    tags = list(dict.fromkeys(raw_tags))[:3]
+    await db.set_tags(message.from_user.id, tags)
+
+    display = " ".join(f"#{t}" for t in tags)
+    await message.answer(
+        f"✅ Tags saved: <b>{display}</b>\n\n"
+        "These will be used to find like-minded strangers!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU_KB,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Find stranger — show target gender selection
+# ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "find_stranger")
 async def cb_find_stranger(cb: CallbackQuery) -> None:
     await cb.answer()
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    if user["s"] == 0:
-        await cb.message.answer("🚫 You are banned.")
+
+    active = await db.lift_expired_temp_ban(cb.from_user.id)
+    if not active:
+        await cb.message.answer("🚫 You are banned and cannot use this feature.")
         return
-    if user.get("r_id"):
-        await cb.message.answer("⚠️ Leave the group chat room first.", reply_markup=CHAT_KB)
-        return
+
     if user.get("p_id"):
-        await cb.message.answer("⚠️ Already in a 1-on-1 chat.", reply_markup=STRANGER_KB)
+        await cb.message.answer(
+            "You are already in a chat. Use <b>🔚 Stop Chat</b> to exit first.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=STRANGER_KB,
+        )
         return
-    await _do_find(cb.bot, cb.from_user.id, user)
+
+    if not user.get("g"):
+        await cb.message.answer(
+            "Please set your gender first:",
+            reply_markup=GENDER_SELECT_KB,
+        )
+        return
+
+    tags = user.get("tags", [])
+    tag_hint = (
+        f"\n🏷️ Your tags: {' '.join('#' + t for t in tags)}" if tags
+        else "\n💡 Tip: Set /tags to find like-minded strangers!"
+    )
+
+    await cb.message.answer(
+        f"Who would you like to talk to?{tag_hint}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=TARGET_GENDER_KB,
+    )
+
+
+@router.callback_query(F.data.in_({"tg_any", "tg_m", "tg_f"}))
+async def cb_target_gender(cb: CallbackQuery) -> None:
+    await cb.answer()
+    mapping = {"tg_any": "any", "tg_m": "M", "tg_f": "F"}
+    target_gender = mapping[cb.data]
+
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
+    if user.get("p_id"):
+        await cb.message.answer("You are already in a chat.", reply_markup=STRANGER_KB)
+        return
+
+    labels = {"any": "Anyone 🌐", "M": "Boys 👦", "F": "Girls 👧"}
+    await cb.message.answer(
+        f"✅ Searching for: <b>{labels[target_gender]}</b>\n🔍 Looking for your match…",
+        parse_mode=ParseMode.HTML,
+    )
+    await _do_find(cb.bot, cb.from_user.id, target_gender)
+
+
+# ---------------------------------------------------------------------------
+# /tags command shortcut
+# ---------------------------------------------------------------------------
+
+@router.message(Command("tags"))
+async def cmd_tags(message: Message, state: FSMContext) -> None:
+    user = await db.get_user(message.from_user.id)
+    current = ", ".join(f"#{t}" for t in user.get("tags", [])) if user and user.get("tags") else "none"
+    await state.set_state(UserStates.entering_tags)
+    await message.answer(
+        f"🏷️ <b>Your current tags:</b> {current}\n\n"
+        "Send up to <b>3 hashtags</b> separated by spaces.\n"
+        "Example: <code>#gaming #movies #kpop</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stranger chat — incoming messages
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == STOP_TEXT)
+async def stop_chat(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        return
+
+    if await db.is_in_queue(message.from_user.id):
+        await db.leave_queue(message.from_user.id)
+        await message.answer(
+            "🔚 Search cancelled.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await message.answer("Want to try again?", reply_markup=MAIN_MENU_KB)
+        return
+
+    partner_id = user.get("p_id")
+    if not partner_id:
+        await message.answer(
+            "You are not in a chat.", reply_markup=ReplyKeyboardRemove()
+        )
+        await message.answer("Return to menu:", reply_markup=MAIN_MENU_KB)
+        return
+
+    await _disconnect_stranger(message.bot, message.from_user.id, partner_id, notify_partner=True)
+    await message.answer("🔚 You left the chat.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Want to find another stranger?", reply_markup=MAIN_MENU_KB)
 
 
 @router.message(F.text == NEXT_TEXT)
@@ -515,135 +724,149 @@ async def next_stranger(message: Message) -> None:
     user = await db.get_user(message.from_user.id)
     if not user:
         return
-    if user.get("p_id"):
-        await _disconnect_stranger(message.bot, message.from_user.id, user["p_id"])
+
+    partner_id = user.get("p_id")
+    if partner_id:
+        await _disconnect_stranger(
+            message.bot, message.from_user.id, partner_id, notify_partner=True
+        )
+
     await db.leave_queue(message.from_user.id)
-    await message.answer("🔄 Looking for a new stranger…", reply_markup=STRANGER_KB)
-    await _do_find(message.bot, message.from_user.id, user)
+    await message.answer("🔍 Finding next stranger…", parse_mode=ParseMode.HTML)
+    await _do_find(message.bot, message.from_user.id, "any")
 
 
-@router.message(F.text == STOP_TEXT)
-async def stop_stranger(message: Message) -> None:
+@router.message(F.text == REPORT_TEXT)
+async def report_stranger(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("p_id"):
+        await message.answer("You are not in a chat.")
+        return
+
+    partner_id = user["p_id"]
+
+    await _disconnect_stranger(
+        message.bot, message.from_user.id, partner_id, notify_partner=False
+    )
+
+    new_count = await db.add_report(message.from_user.id, partner_id)
+
+    await message.answer(
+        "🚨 <b>Report submitted.</b>\n"
+        "You have been disconnected from that user.\n"
+        "Looking for a new stranger…",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    if new_count >= db.AUTO_BAN_REPORT_THRESHOLD:
+        try:
+            await message.bot.send_message(
+                partner_id,
+                "🚫 Your account has been suspended for 24 hours due to multiple reports.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await message.bot.send_message(
+                partner_id,
+                "⚠️ You have been reported and disconnected.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await message.bot.send_message(partner_id, "Find someone new?", reply_markup=MAIN_MENU_KB)
+        except Exception:
+            pass
+
+    await _do_find(message.bot, message.from_user.id, "any")
+
+
+@router.message(F.chat.type == "private")
+async def on_private_message(message: Message, state: FSMContext) -> None:
+    """Main relay handler for all private messages while in a stranger chat."""
+    if not message.from_user:
+        return
+
+    current_state = await state.get_state()
+    if current_state == UserStates.entering_tags.state:
+        return
+
     user = await db.get_user(message.from_user.id)
     if not user:
         return
-    if user.get("p_id"):
-        await _disconnect_stranger(message.bot, message.from_user.id, user["p_id"])
-    await db.leave_queue(message.from_user.id)
-    await message.answer("👋 You have left the stranger chat.", reply_markup=ReplyKeyboardRemove())
-    await message.answer("Back to the main menu:", reply_markup=MAIN_MENU_KB)
 
-
-# ---------------------------------------------------------------------------
-# Message routing — text + ALL media types
-# ---------------------------------------------------------------------------
-
-@router.message(F.text & ~F.text.startswith("/"))
-async def route_text(message: Message) -> None:
-    if message.text in (LEAVE_TEXT, NEXT_TEXT, STOP_TEXT):
+    partner_id = user.get("p_id")
+    if not partner_id:
+        if message.text and not message.text.startswith("/"):
+            await message.answer(
+                "You are not in a chat. Use the menu below.",
+                reply_markup=MAIN_MENU_KB,
+            )
         return
-    user = await db.get_user(message.from_user.id)
-    if not user or user["s"] == 0:
+
+    # Rate limit check
+    if _is_rate_limited(message.from_user.id):
+        await message.answer(
+            "⚡ You're sending too fast! Please wait a moment.",
+        )
         return
-    if user.get("p_id"):
-        await _send_to_stranger(message.bot, user["p_id"], user["n"], message)
-    elif user.get("r_id"):
-        await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
 
-
-@router.message(
-    F.photo | F.video | F.video_note | F.animation
-    | F.sticker | F.voice | F.audio | F.document | F.gift
-)
-async def route_media(message: Message) -> None:
-    user = await db.get_user(message.from_user.id)
-    if not user or user["s"] == 0:
+    # Bad words filter (text and captions only)
+    check_text = message.text or message.caption or ""
+    if check_text and _has_bad_words(check_text):
+        await message.answer(
+            "⚠️ Your message contains inappropriate content and was not sent.\n"
+            "Please keep the conversation respectful.",
+        )
         return
-    if user.get("p_id"):
-        await _send_to_stranger(message.bot, user["p_id"], user["n"], message)
-    elif user.get("r_id"):
-        await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
 
+    # Determine reply_to_partner_msg_id for reply sync
+    reply_to_partner_msg_id: int | None = None
+    if message.reply_to_message:
+        replied_to_msg_id = message.reply_to_message.message_id
+        doc = await db.find_msg_by_copy(message.chat.id, replied_to_msg_id)
+        if doc:
+            for (copy_chat, copy_msg) in doc["c"]:
+                if copy_chat == partner_id:
+                    reply_to_partner_msg_id = copy_msg
+                    break
 
-# ---------------------------------------------------------------------------
-# /admin command
-# ---------------------------------------------------------------------------
-
-PER_PAGE = 15
-
-
-def build_userlist_text(users: list[dict], page: int, total: int) -> str:
-    total_pages = max(1, -(-total // PER_PAGE))
-    lines = [f"👥 <b>User List</b> — Page {page + 1}/{total_pages} (Total: {total})\n"]
-    for u in users:
-        status = "🚫" if u["s"] == 0 else ("💬" if u.get("r_id") else "✅")
-        uname = f"@{u['u']}" if u.get("u") else "no username"
-        lines.append(f"{status} <b>{u['n']}</b> — {uname} (<code>{u['_id']}</code>)")
-    return "\n".join(lines)
-
-
-def build_userlist_kb(page: int, total: int) -> InlineKeyboardMarkup:
-    total_pages = max(1, -(-total // PER_PAGE))
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"ul_page:{page - 1}"))
-    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ul_noop"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"ul_page:{page + 1}"))
-    return InlineKeyboardMarkup(inline_keyboard=[
-        nav,
-        [InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="adm_back")],
-    ])
-
-
-@router.message(Command("userlist"))
-async def cmd_userlist(message: Message) -> None:
-    if not is_admin_pm(message):
-        return
-    users, total = await db.get_users_paginated(0, PER_PAGE)
-    await message.answer(
-        build_userlist_text(users, 0, total),
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_userlist_kb(0, total),
+    await _send_to_stranger(
+        message.bot,
+        sender_id=message.from_user.id,
+        sender_msg_id=message.message_id,
+        partner_id=partner_id,
+        alias=user["n"],
+        message=message,
+        reply_to_partner_msg_id=reply_to_partner_msg_id,
     )
 
 
-@router.callback_query(F.data.startswith("ul_page:"))
-async def cb_userlist_page(cb: CallbackQuery) -> None:
-    if not is_admin_pm_cb(cb):
-        await cb.answer()
-        return
-    await cb.answer()
-    page = int(cb.data.split(":")[1])
-    users, total = await db.get_users_paginated(page, PER_PAGE)
-    await cb.message.edit_text(
-        build_userlist_text(users, page, total),
-        parse_mode=ParseMode.HTML,
-        reply_markup=build_userlist_kb(page, total),
-    )
-
-
-@router.callback_query(F.data == "ul_noop")
-async def cb_userlist_noop(cb: CallbackQuery) -> None:
-    await cb.answer()
-
+# ---------------------------------------------------------------------------
+# Admin panel
+# ---------------------------------------------------------------------------
 
 @router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext) -> None:
+async def cmd_admin(message: Message) -> None:
     if not is_admin_pm(message):
         return
-    await state.clear()
-    await message.answer("🛡️ <b>Admin Panel</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_MENU_KB)
+    await message.answer(
+        "🛡️ <b>Admin Panel</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ADMIN_MENU_KB,
+    )
 
 
 @router.callback_query(F.data == "adm_back")
-async def adm_back(cb: CallbackQuery, state: FSMContext) -> None:
+async def adm_back(cb: CallbackQuery) -> None:
     if not is_admin_pm_cb(cb):
         await cb.answer()
         return
-    await state.clear()
     await cb.answer()
-    await cb.message.edit_text("🛡️ <b>Admin Panel</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_MENU_KB)
+    await cb.message.edit_text(
+        "🛡️ <b>Admin Panel</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_MENU_KB
+    )
 
 
 @router.callback_query(F.data == "adm_stats")
@@ -653,19 +876,17 @@ async def adm_stats(cb: CallbackQuery) -> None:
         return
     await cb.answer()
 
-    total = await db.count_users()
-    banned = await db.count_banned()
-    active_chat = await db.count_active_chatters()
-    rooms = await db.count_active_rooms()
+    total   = await db.count_users()
+    banned  = await db.count_banned()
+    active  = await db.count_active_chatters()
     waiting = await db.count_waiting()
 
     text = (
         "📊 <b>System Statistics</b>\n\n"
-        f"👤 Total registered users: <b>{total}</b>\n"
-        f"🚫 Banned users: <b>{banned}</b>\n"
-        f"💬 Active chatters: <b>{active_chat}</b>\n"
-        f"🏠 Active rooms: <b>{rooms}</b>\n"
-        f"🔍 Waiting for stranger: <b>{waiting}</b>"
+        f"👤 Total registered: <b>{total}</b>\n"
+        f"🚫 Banned users:     <b>{banned}</b>\n"
+        f"💬 Active in chat:   <b>{active}</b>\n"
+        f"🔍 Waiting in queue: <b>{waiting}</b>"
     )
     await cb.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=BACK_KB)
 
@@ -678,7 +899,7 @@ async def adm_broadcast_prompt(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
     await state.set_state(AdminStates.waiting_broadcast)
     await cb.message.edit_text(
-        "📢 <b>Global Broadcast</b>\n\nSend the message (text or photo) to broadcast to all active users.",
+        "📢 <b>Global Broadcast</b>\n\nSend the message (text or photo) to broadcast.",
         parse_mode=ParseMode.HTML,
         reply_markup=BACK_KB,
     )
@@ -746,19 +967,22 @@ async def adm_do_ban(message: Message, state: FSMContext) -> None:
 
     await db.ban_user(target_id)
 
-    if target.get("r_id"):
-        await exit_room(message.bot, target_id, target)
-        try:
-            await message.bot.send_message(
-                target_id,
-                "🚫 You have been banned and removed from the chat room.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        except Exception:
-            pass
+    if target.get("p_id"):
+        await _disconnect_stranger(message.bot, target_id, target["p_id"], notify_partner=True)
+    elif await db.is_in_queue(target_id):
+        await db.leave_queue(target_id)
+
+    try:
+        await message.bot.send_message(
+            target_id,
+            "🚫 You have been permanently banned.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception:
+        pass
 
     await message.answer(
-        f"✅ User <code>{target_id}</code> ({target.get('n', 'unknown')}) has been banned.",
+        f"✅ User <code>{target_id}</code> (<b>{target.get('n', 'unknown')}</b>) has been banned.",
         parse_mode=ParseMode.HTML,
         reply_markup=ADMIN_MENU_KB,
     )
@@ -796,14 +1020,14 @@ async def adm_do_unban(message: Message, state: FSMContext) -> None:
 
     await db.unban_user(target_id)
     await message.answer(
-        f"✅ User <code>{target_id}</code> ({target.get('n', 'unknown')}) has been unbanned.",
+        f"✅ User <code>{target_id}</code> (<b>{target.get('n', 'unknown')}</b>) has been unbanned.",
         parse_mode=ParseMode.HTML,
         reply_markup=ADMIN_MENU_KB,
     )
 
 
 # ---------------------------------------------------------------------------
-# Dummy web server
+# Dummy web server (keeps Render.com service alive)
 # ---------------------------------------------------------------------------
 
 async def dummy_web_server() -> None:
@@ -829,16 +1053,16 @@ async def main() -> None:
     from config import BOT_TOKEN
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
     await db.ensure_indexes()
     await dummy_web_server()
 
-    log.info("Bot is starting…")
+    log.info("Bot starting (1-on-1 stranger chat mode)…")
     await dp.start_polling(
         bot,
-        allowed_updates=["message", "callback_query", "message_reaction"],
+        allowed_updates=["message", "callback_query", "message_reaction", "edited_message"],
     )
 
 
