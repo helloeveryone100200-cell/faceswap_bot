@@ -186,6 +186,21 @@ async def get_user_by_alias_in_room(alias: str, room_id: str) -> dict | None:
     return await users_col.find_one({"_id": {"$in": members}, "n": alias})
 
 
+async def get_active_rooms() -> list[dict]:
+    rooms = await rooms_col.find({"c": {"$gt": 0}}).to_list(None)
+    result = []
+    for room in rooms:
+        members = await users_col.find(
+            {"_id": {"$in": room.get("u_ids", [])}}, {"_id": 1, "n": 1}
+        ).to_list(None)
+        result.append({
+            "_id": room["_id"],
+            "c": room.get("c", 0),
+            "members": members,
+        })
+    return result
+
+
 async def request_reveal_targeted(requester_id: int, target_uid: int) -> bool:
     """
     Targeted reveal: requester → target only.
