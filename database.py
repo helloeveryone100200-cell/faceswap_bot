@@ -161,6 +161,23 @@ async def get_all_users() -> list[dict]:
     ).sort("j", -1).to_list(None)
 
 
+async def set_user_alias(user_id: int, new_alias: str) -> str:
+    """
+    Updates user's anonymous alias.
+    Returns 'ok' on success, 'conflict' if another member in same room uses that name.
+    """
+    user = await users_col.find_one({"_id": user_id}, {"r_id": 1})
+    room_id = user.get("r_id") if user else None
+    if room_id:
+        conflict = await users_col.find_one(
+            {"_id": {"$ne": user_id}, "r_id": room_id, "n": new_alias}
+        )
+        if conflict:
+            return "conflict"
+    await users_col.update_one({"_id": user_id}, {"$set": {"n": new_alias}})
+    return "ok"
+
+
 async def get_user_by_alias_in_room(alias: str, room_id: str) -> dict | None:
     room = await rooms_col.find_one({"_id": room_id}, {"u_ids": 1})
     if not room:
