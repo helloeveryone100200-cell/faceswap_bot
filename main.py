@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import secrets as _sec
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -26,6 +27,13 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 router = Router()
+
+# How long (seconds) system join/leave notifications stay before auto-delete
+NOTIFICATION_TTL = 30
+
+# Reaction emojis shown under every broadcasted message
+REACTIONS: list[str] = ["👍", "❤️", "😂", "😮", "😢", "👏"]
+
 
 # ---------------------------------------------------------------------------
 # Keyboards
@@ -61,8 +69,18 @@ STRANGER_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# How long (seconds) system join/leave notifications stay before auto-delete
-NOTIFICATION_TTL = 30
+
+def build_reaction_kb(msg_key: str, counts: dict) -> InlineKeyboardMarkup:
+    """Build a single-row inline keyboard with emoji reaction buttons + counts."""
+    row = []
+    for emoji in REACTIONS:
+        n = counts.get(emoji, 0)
+        label = f"{emoji} {n}" if n > 0 else emoji
+        row.append(InlineKeyboardButton(
+            text=label,
+            callback_data=f"rx:{msg_key}:{emoji}",
+        ))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +117,7 @@ def is_admin_pm_cb(cb: CallbackQuery) -> bool:
 # Auto-delete helper
 # ---------------------------------------------------------------------------
 
-async def _schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int = NOTIFICATION_TTL) -> None:
-    """Wait `delay` seconds then silently delete a message."""
+async def _schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id, message_id)
@@ -109,7 +126,6 @@ async def _schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int =
 
 
 def _auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int = NOTIFICATION_TTL) -> None:
-    """Fire-and-forget: schedule deletion without blocking the caller."""
     asyncio.create_task(_schedule_delete(bot, chat_id, message_id, delay))
 
 
@@ -137,98 +153,192 @@ async def exit_room(bot: Bot, user_id: int, user_doc: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Media relay — HTML formatting, clean two-line layout
+# Media relay — HTML formatting + optional reaction keyboard
 # ---------------------------------------------------------------------------
 
-async def _relay_message(bot: Bot, to_id: int, alias: str, message: Message) -> None:
-    """Relay any supported message type to a single recipient using HTML formatting."""
+async def _relay_message(
+    bot: Bot,
+    to_id: int,
+    alias: str,
+    message: Message,
+    reaction_kb: InlineKeyboardMarkup | None = None,
+) -> Message | None:
+    """
+    Relay a message to one recipient.
+    Returns the sent Message that carries the reaction keyboard (may differ
+    from the label message for sticker/video_note), or None on error.
+    """
     try:
         if message.text:
-            text = f"<b>{alias}</b>\n{message.text}"
-            await bot.send_message(to_id, text, parse_mode=ParseMode.HTML)
+            return await bot.send_message(
+                to_id,
+                f"<b>{alias}</b>\n{message.text}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=reaction_kb,
+            )
 
         elif message.sticker:
+            # Label (no kb) + sticker (with kb)
             await bot.send_message(
-                to_id,
-                f"<b>{alias}</b> sent a sticker:",
-                parse_mode=ParseMode.HTML,
+                to_id, f"<b>{alias}</b> sent a sticker:", parse_mode=ParseMode.HTML
             )
-            await bot.send_sticker(to_id, message.sticker.file_id)
+            return await bot.send_sticker(
+                to_id, message.sticker.file_id, reply_markup=reaction_kb
+            )
 
         elif message.photo:
             caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b>"
-            await bot.send_photo(to_id, message.photo[-1].file_id, caption=caption, parse_mode=ParseMode.HTML)
+            return await bot.send_photo(
+                to_id, message.photo[-1].file_id,
+                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+            )
 
         elif message.video:
             caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎬"
-            await bot.send_video(to_id, message.video.file_id, caption=caption, parse_mode=ParseMode.HTML)
+            return await bot.send_video(
+                to_id, message.video.file_id,
+                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+            )
 
         elif message.video_note:
+            # Label (no kb) + video note (with kb)
             await bot.send_message(
-                to_id,
-                f"<b>{alias}</b> sent a video message:",
-                parse_mode=ParseMode.HTML,
+                to_id, f"<b>{alias}</b> sent a video message:", parse_mode=ParseMode.HTML
             )
-            await bot.send_video_note(to_id, message.video_note.file_id)
+            return await bot.send_video_note(
+                to_id, message.video_note.file_id, reply_markup=reaction_kb
+            )
 
         elif message.animation:
             caption = f"<b>{alias}</b>\n{message.caption}" if message.caption else f"<b>{alias}</b> 🎞️"
-            await bot.send_animation(to_id, message.animation.file_id, caption=caption, parse_mode=ParseMode.HTML)
+            return await bot.send_animation(
+                to_id, message.animation.file_id,
+                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+            )
 
         elif message.voice:
-            await bot.send_voice(
-                to_id,
-                message.voice.file_id,
-                caption=f"<b>{alias}</b> 🎙️",
-                parse_mode=ParseMode.HTML,
+            return await bot.send_voice(
+                to_id, message.voice.file_id,
+                caption=f"<b>{alias}</b> 🎙️", parse_mode=ParseMode.HTML,
+                reply_markup=reaction_kb,
             )
 
         elif message.audio:
             title = message.audio.title or "audio"
             caption = f"<b>{alias}</b> 🎵\n<i>{title}</i>"
-            await bot.send_audio(to_id, message.audio.file_id, caption=caption, parse_mode=ParseMode.HTML)
+            return await bot.send_audio(
+                to_id, message.audio.file_id,
+                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+            )
 
         elif message.document:
             fname = message.document.file_name or "file"
-            if message.caption:
-                caption = f"<b>{alias}</b>\n{message.caption}"
-            else:
-                caption = f"<b>{alias}</b> 📎\n<i>{fname}</i>"
-            await bot.send_document(to_id, message.document.file_id, caption=caption, parse_mode=ParseMode.HTML)
+            caption = (
+                f"<b>{alias}</b>\n{message.caption}"
+                if message.caption
+                else f"<b>{alias}</b> 📎\n<i>{fname}</i>"
+            )
+            return await bot.send_document(
+                to_id, message.document.file_id,
+                caption=caption, parse_mode=ParseMode.HTML, reply_markup=reaction_kb,
+            )
 
         elif message.gift:
             star_count = getattr(message.gift.gift, "star_count", "?")
-            await bot.send_message(
+            return await bot.send_message(
                 to_id,
                 f"🎁 <b>{alias}</b> sent a gift worth <b>{star_count} ⭐</b>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=reaction_kb,
             )
 
         elif message.paid_media:
-            await bot.send_message(
+            return await bot.send_message(
                 to_id,
                 f"💎 <b>{alias}</b> shared paid media.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=reaction_kb,
             )
 
     except Exception as e:
         log.warning("Failed to relay to %s: %s", to_id, e)
 
+    return None
+
 
 # ---------------------------------------------------------------------------
-# Broadcast to all room members / send to stranger
+# Broadcast to all room members (with reactions)
 # ---------------------------------------------------------------------------
 
-async def _broadcast_to_room(bot: Bot, sender_id: int, room_id: str, alias: str, message: Message) -> None:
+async def _broadcast_to_room(
+    bot: Bot, sender_id: int, room_id: str, alias: str, message: Message
+) -> None:
     members = await db.get_room_members(room_id)
-    for mid in members:
-        if mid == sender_id:
-            continue
-        await _relay_message(bot, mid, alias, message)
+    recipients = [m for m in members if m != sender_id]
+    if not recipients:
+        return
+
+    msg_key = _sec.token_urlsafe(6)          # 8-char URL-safe key
+    rx_kb = build_reaction_kb(msg_key, {})   # empty counts initially
+
+    copies: list[list[int]] = []
+    for mid in recipients:
+        sent = await _relay_message(bot, mid, alias, message, reaction_kb=rx_kb)
+        if sent:
+            copies.append([mid, sent.message_id])
+
+    if copies:
+        await db.create_msg(msg_key, copies)
 
 
-async def _send_to_stranger(bot: Bot, partner_id: int, alias: str, message: Message) -> None:
-    await _relay_message(bot, partner_id, alias, message)
+# ---------------------------------------------------------------------------
+# Send to 1-on-1 stranger partner (with reactions)
+# ---------------------------------------------------------------------------
+
+async def _send_to_stranger(
+    bot: Bot, partner_id: int, alias: str, message: Message
+) -> None:
+    msg_key = _sec.token_urlsafe(6)
+    rx_kb = build_reaction_kb(msg_key, {})
+
+    sent = await _relay_message(bot, partner_id, alias, message, reaction_kb=rx_kb)
+    if sent:
+        await db.create_msg(msg_key, [[partner_id, sent.message_id]])
+
+
+# ---------------------------------------------------------------------------
+# Reaction callback handler
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("rx:"))
+async def handle_reaction(cb: CallbackQuery) -> None:
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await cb.answer()
+        return
+
+    _, msg_key, emoji = parts
+    result = await db.toggle_reaction(msg_key, cb.from_user.id, emoji)
+
+    if result is None:
+        await cb.answer("⏰ Message expired.", show_alert=False)
+        return
+
+    new_counts, copies = result
+    new_kb = build_reaction_kb(msg_key, new_counts)
+
+    # Update the reaction keyboard on every copy of this message
+    for (chat_id, msg_id) in copies:
+        try:
+            await cb.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=new_kb,
+            )
+        except Exception:
+            pass
+
+    await cb.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -276,10 +386,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "join_chat")
 async def cb_join_chat(cb: CallbackQuery) -> None:
     await cb.answer()
-    user = await db.get_or_create_user(
-        cb.from_user.id,
-        cb.from_user.username,
-    )
+    user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
     if user["s"] == 0:
         await cb.message.answer("🚫 You have been banned from this service.")
         return
@@ -302,7 +409,6 @@ async def cb_join_chat(cb: CallbackQuery) -> None:
         reply_markup=CHAT_KB,
     )
 
-    # Notify existing members — auto-delete after NOTIFICATION_TTL seconds
     for mid in members:
         if mid != cb.from_user.id:
             try:
@@ -338,7 +444,6 @@ async def leave_room(message: Message) -> None:
     await message.answer("👋 You have left the chat room.", reply_markup=ReplyKeyboardRemove())
     await message.answer("Want to join again?", reply_markup=MAIN_MENU_KB)
 
-    # Notify remaining members — auto-delete after NOTIFICATION_TTL seconds
     for mid in members:
         if mid != message.from_user.id:
             try:
@@ -356,7 +461,9 @@ async def leave_room(message: Message) -> None:
 # Stranger chat helpers
 # ---------------------------------------------------------------------------
 
-async def _disconnect_stranger(bot: Bot, user_id: int, partner_id: int, notify_partner: bool = True) -> None:
+async def _disconnect_stranger(
+    bot: Bot, user_id: int, partner_id: int, notify_partner: bool = True
+) -> None:
     await db.set_partner(user_id, None)
     await db.set_partner(partner_id, None)
     if notify_partner:
@@ -409,8 +516,6 @@ async def _do_find(bot: Bot, user_id: int, user: dict) -> None:
     )
 
 
-# /find command & callback
-
 @router.message(Command("find"))
 async def cmd_find(message: Message) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.from_user.username)
@@ -442,8 +547,6 @@ async def cb_find_stranger(cb: CallbackQuery) -> None:
     await _do_find(cb.bot, cb.from_user.id, user)
 
 
-# ⏭️ Next Stranger
-
 @router.message(F.text == NEXT_TEXT)
 async def next_stranger(message: Message) -> None:
     user = await db.get_user(message.from_user.id)
@@ -455,8 +558,6 @@ async def next_stranger(message: Message) -> None:
     await message.answer("🔄 Looking for a new stranger…", reply_markup=STRANGER_KB)
     await _do_find(message.bot, message.from_user.id, user)
 
-
-# 🔚 Stop Chat
 
 @router.message(F.text == STOP_TEXT)
 async def stop_stranger(message: Message) -> None:
@@ -488,15 +589,8 @@ async def route_text(message: Message) -> None:
 
 
 @router.message(
-    F.photo
-    | F.video
-    | F.video_note
-    | F.animation
-    | F.sticker
-    | F.voice
-    | F.audio
-    | F.document
-    | F.gift
+    F.photo | F.video | F.video_note | F.animation
+    | F.sticker | F.voice | F.audio | F.document | F.gift
 )
 async def route_media(message: Message) -> None:
     user = await db.get_user(message.from_user.id)
@@ -527,16 +621,16 @@ def build_userlist_text(users: list[dict], page: int, total: int) -> str:
 
 def build_userlist_kb(page: int, total: int) -> InlineKeyboardMarkup:
     total_pages = max(1, -(-total // PER_PAGE))
-    buttons = []
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"ul_page:{page - 1}"))
     nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ul_noop"))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"ul_page:{page + 1}"))
-    buttons.append(nav)
-    buttons.append([InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="adm_back")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        nav,
+        [InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="adm_back")],
+    ])
 
 
 @router.message(Command("userlist"))
@@ -578,10 +672,6 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("🛡️ <b>Admin Panel</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_MENU_KB)
 
-
-# ---------------------------------------------------------------------------
-# Admin callbacks
-# ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "adm_back")
 async def adm_back(cb: CallbackQuery, state: FSMContext) -> None:
@@ -625,7 +715,7 @@ async def adm_broadcast_prompt(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
     await state.set_state(AdminStates.waiting_broadcast)
     await cb.message.edit_text(
-        "📢 <b>Global Broadcast</b>\n\nSend the message (text or photo) you want to broadcast to all active users.",
+        "📢 <b>Global Broadcast</b>\n\nSend the message (text or photo) to broadcast to all active users.",
         parse_mode=ParseMode.HTML,
         reply_markup=BACK_KB,
     )
@@ -638,8 +728,7 @@ async def adm_do_broadcast(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     users = await db.get_all_active_users()
-    sent = 0
-    failed = 0
+    sent = failed = 0
 
     for user in users:
         uid = user["_id"]
@@ -649,9 +738,7 @@ async def adm_do_broadcast(message: Message, state: FSMContext) -> None:
                 await message.bot.send_photo(uid, message.photo[-1].file_id, caption=f"📢 {caption}")
             elif message.text:
                 await message.bot.send_message(
-                    uid,
-                    f"📢 <b>Broadcast:</b>\n\n{message.text}",
-                    parse_mode=ParseMode.HTML,
+                    uid, f"📢 <b>Broadcast:</b>\n\n{message.text}", parse_mode=ParseMode.HTML
                 )
             sent += 1
         except Exception:
@@ -682,7 +769,6 @@ async def adm_ban_prompt(cb: CallbackQuery, state: FSMContext) -> None:
 async def adm_do_ban(message: Message, state: FSMContext) -> None:
     if not is_admin_pm(message):
         return
-
     if not message.text or not message.text.strip().lstrip("-").isdigit():
         await message.answer("⚠️ Please send a valid numeric User ID.")
         return
@@ -733,7 +819,6 @@ async def adm_unban_prompt(cb: CallbackQuery, state: FSMContext) -> None:
 async def adm_do_unban(message: Message, state: FSMContext) -> None:
     if not is_admin_pm(message):
         return
-
     if not message.text or not message.text.strip().lstrip("-").isdigit():
         await message.answer("⚠️ Please send a valid numeric User ID.")
         return
@@ -755,7 +840,7 @@ async def adm_do_unban(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dummy web server (port binding for Render / web service platforms)
+# Dummy web server
 # ---------------------------------------------------------------------------
 
 async def dummy_web_server() -> None:
@@ -783,6 +868,9 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    # Create MongoDB indexes (TTL on msg collection, etc.)
+    await db.ensure_indexes()
 
     await dummy_web_server()
 
