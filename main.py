@@ -1,984 +1,494 @@
 import asyncio
 import logging
-import os
-import re
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Animation,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
-    PhotoSize,
-    Sticker,
-    Voice,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 import database as db
-from config import ADMIN_IDS, BOT_TOKEN
+from config import ADMIN_IDS, DUMMY_PORT
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 router = Router()
 
-# Regex to extract alias from forwarded room messages: "[alias] 💬"
-ALIAS_RE = re.compile(r"^\[(.+?)\]")
+# ---------------------------------------------------------------------------
+# Keyboards
+# ---------------------------------------------------------------------------
+
+MAIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="💬 Join Anonymous Chat", callback_data="join_chat")]
+])
+
+CHAT_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="🔕 Leave Chat Room")]],
+    resize_keyboard=True,
+)
+
+ADMIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="📊 System Stats", callback_data="adm_stats")],
+    [InlineKeyboardButton(text="📢 Global Broadcast", callback_data="adm_broadcast")],
+    [InlineKeyboardButton(text="🔨 Ban User", callback_data="adm_ban")],
+    [InlineKeyboardButton(text="🔓 Unban User", callback_data="adm_unban")],
+])
+
+BACK_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="adm_back")]
+])
+
+LEAVE_TEXT = "🔕 Leave Chat Room"
 
 
-# ─── FSM States ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# FSM States
+# ---------------------------------------------------------------------------
 
-class AdminFSM(StatesGroup):
-    broadcast = State()
-    ban = State()
-    unban = State()
-
-
-class UserFSM(StatesGroup):
-    setname = State()
+class AdminStates(StatesGroup):
+    waiting_broadcast = State()
+    waiting_ban_id = State()
+    waiting_unban_id = State()
 
 
-# ─── Keyboards ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Guards
+# ---------------------------------------------------------------------------
 
-def kb_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 အမည်ဝှက် စကားဝိုင်းသို့ ဝင်ရန်", callback_data="join_room")],
-    ])
-
-
-def kb_in_room(room_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="❤️ အကောင့်ချင်းချိတ်ရန်", callback_data=f"reveal:{room_id}"),
-            InlineKeyboardButton(text="🔕 ထွက်ရန်", callback_data=f"leave:{room_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="✏️ နာမည်ပြောင်းရန်", callback_data="setname"),
-        ],
-    ])
-
-
-def kb_cancel_setname() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ မလုပ်တော့ပါ", callback_data="cancel_setname")],
-    ])
-
-
-def kb_admin_panel() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 စာရင်းဇယား ကြည့်ရန်", callback_data="admin:stats")],
-        [InlineKeyboardButton(text="👥 User List ကြည့်ရန်", callback_data="admin:userlist")],
-        [InlineKeyboardButton(text="🚪 Active Rooms ကြည့်ရန်", callback_data="admin:rooms")],
-        [InlineKeyboardButton(text="📢 အားလုံးထံ စာပို့ရန် (Broadcast)", callback_data="admin:broadcast")],
-        [InlineKeyboardButton(text="🔨 User ကို Ban မည်", callback_data="admin:ban")],
-        [InlineKeyboardButton(text="🔓 User ကို Unban မည်", callback_data="admin:unban")],
-    ])
-
-
-def kb_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ နောက်သို့ ပြန်သွားရန်", callback_data="admin:back")],
-    ])
-
-
-# ─── Guards ──────────────────────────────────────────────────────────────────
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def is_private(message: Message) -> bool:
-    return message.chat.type == "private"
-
-
-# ─── Name validation ─────────────────────────────────────────────────────────
-
-NAME_MIN = 2
-NAME_MAX = 30
-NAME_FORBIDDEN_RE = re.compile(r"[`*_\[\]()~>#+=|{}.!\\]")
-
-
-# ─── Broadcast helper ────────────────────────────────────────────────────────
-
-async def do_broadcast(bot: Bot, user_ids: list[int], source: Message) -> tuple[int, int]:
-    ok = fail = 0
-    for uid in user_ids:
-        try:
-            if source.photo:
-                caption = source.caption or ""
-                await bot.send_photo(uid, source.photo[-1].file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
-            elif source.text:
-                await bot.send_message(uid, source.text, parse_mode=ParseMode.MARKDOWN)
-            ok += 1
-        except Exception:
-            fail += 1
-        await asyncio.sleep(0.05)
-    return ok, fail
-
-
-# ─── Room broadcast ──────────────────────────────────────────────────────────
-
-async def broadcast_to_room(bot: Bot, room_id: str, sender_id: int, alias: str, message: Message) -> None:
-    members = await db.get_room_members(room_id, exclude_user_id=sender_id)
-    kb = kb_in_room(room_id)
-    header = f"*\\[{alias}\\] 💬*\n"
-
-    for uid in members:
-        try:
-            if message.text:
-                await bot.send_message(uid, header + message.text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-            elif message.photo:
-                cap = header + (message.caption or "")
-                await bot.send_photo(uid, message.photo[-1].file_id, caption=cap, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-            elif message.voice:
-                await bot.send_voice(uid, message.voice.file_id, caption=f"*\\[{alias}\\]* 🎤", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-            elif message.animation:
-                await bot.send_animation(uid, message.animation.file_id, caption=f"*\\[{alias}\\]* 🎞️", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-            elif message.sticker:
-                await bot.send_sticker(uid, message.sticker.file_id)
-                await bot.send_message(uid, f"*\\[{alias}\\]* 🃏", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb)
-        except Exception as e:
-            logger.warning("Room broadcast failed → %d: %s", uid, e)
-
-
-# ─── /myname ─────────────────────────────────────────────────────────────────
-
-@router.message(Command("myname"))
-async def cmd_myname(message: Message) -> None:
-    if not is_private(message) or not message.from_user:
-        return
-    doc = await db.get_user(message.from_user.id)
-    if not doc:
-        await message.answer("💬 `/start` ရိုက်ပြီး Bot ကို စဖွင့်ပါ", parse_mode=ParseMode.MARKDOWN)
-        return
-    alias = doc.get("n", "?")
-    room_id = doc.get("r_id")
-    room_line = f"🚪 Room: `{room_id}`" if room_id else "⬜ Room ထဲ မရှိသေးပါ"
-    await message.answer(
-        f"📛 **သင်၏ Anonymous နာမည်**\n\n"
-        f"🏷️ **{alias}**\n"
-        f"{room_line}\n\n"
-        f"_နာမည်ပြောင်းလိုပါက အောက်ပါ ခလုတ်ကို နှိပ်ပါ_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ နာမည်ပြောင်းရန်", callback_data="setname")],
-        ]),
+def is_admin_pm(message: Message) -> bool:
+    return (
+        message.chat.type == "private"
+        and message.from_user is not None
+        and message.from_user.id in ADMIN_IDS
     )
 
 
-# ─── /setname ────────────────────────────────────────────────────────────────
-
-@router.message(Command("setname"))
-async def cmd_setname(message: Message, state: FSMContext) -> None:
-    if not is_private(message) or not message.from_user:
-        return
-    doc = await db.get_user(message.from_user.id)
-    if not doc:
-        await message.answer("💬 `/start` ရိုက်ပြီး Bot ကို စဖွင့်ပါ", parse_mode=ParseMode.MARKDOWN)
-        return
-    if doc.get("s", 1) == 0:
-        await message.answer("🚫 Ban ကျနေသောကြောင့် ပြောင်းခွင့်မရပါ")
-        return
-    current = doc.get("n", "?")
-    await state.set_state(UserFSM.setname)
-    await message.answer(
-        f"✏️ **Anonymous နာမည် ပြောင်းရန်**\n\n"
-        f"📛 လက်ရှိ နာမည်: **{current}**\n\n"
-        f"🔤 သင်ကြိုက်သော နာမည်သစ်ကို ရိုက်ထည့်ပါ\n"
-        f"_({NAME_MIN}–{NAME_MAX} လုံး · ` * _ [ ] အစရှိသော Special Char မထည့်ပါနှင့်)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_cancel_setname(),
+def is_admin_pm_cb(cb: CallbackQuery) -> bool:
+    return (
+        cb.message is not None
+        and cb.message.chat.type == "private"
+        and cb.from_user.id in ADMIN_IDS
     )
 
 
-@router.callback_query(F.data == "setname")
-async def cb_setname_btn(cb: CallbackQuery, state: FSMContext) -> None:
-    await cb.answer("✏️ နာမည်သစ် ရိုက်ထည့်ပြီး ပို့လိုက်ပါ", show_alert=False)
-    if not cb.from_user or not cb.message:
-        return
-    doc = await db.get_user(cb.from_user.id)
-    if not doc:
-        await cb.message.answer("Bot ကို /start ဖြင့် စဖွင့်ပါ")
-        return
-    if doc.get("s", 1) == 0:
-        await cb.message.answer("🚫 Ban ကျနေသောကြောင့် ပြောင်းခွင့်မရပါ")
-        return
-    current = doc.get("n", "?")
-    await state.set_state(UserFSM.setname)
-    await cb.message.answer(
-        f"✏️ **Anonymous နာမည် ပြောင်းရန်**\n\n"
-        f"📛 လက်ရှိ နာမည်: **{current}**\n\n"
-        f"🔤 သင်ကြိုက်သော နာမည်သစ်ကို ရိုက်ထည့်ပါ\n"
-        f"_({NAME_MIN}–{NAME_MAX} လုံး · ` * _ [ ] အစရှိသော Special Char မထည့်ပါနှင့်)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_cancel_setname(),
-    )
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
-
-@router.callback_query(F.data == "cancel_setname")
-async def cb_cancel_setname(cb: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    if cb.message:
-        await cb.message.edit_text("❌ နာမည်ပြောင်းမှု မလုပ်တော့ပါ")
-    await cb.answer()
-
-
-@router.message(UserFSM.setname)
-async def handle_setname_input(message: Message, state: FSMContext, bot: Bot) -> None:
-    user = message.from_user
-    if not user or message.chat.type != "private":
-        return
-    if not message.text:
-        await message.answer(
-            "⚠️ ကျေးဇူးပြု၍ **စာသား** ရိုက်ထည့်ပါ",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_cancel_setname(),
-        )
-        return
-
-    raw = message.text.strip()
-
-    if len(raw) < NAME_MIN:
-        await message.answer(
-            f"⚠️ နာမည် အနည်းဆုံး **{NAME_MIN}** လုံး ရှိရမည်\nထပ်ကြိုးစားပါ",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_cancel_setname(),
-        )
-        return
-    if len(raw) > NAME_MAX:
-        await message.answer(
-            f"⚠️ နာမည် အများဆုံး **{NAME_MAX}** လုံးသာ ဖြစ်ရမည်\nထပ်ကြိုးစားပါ",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_cancel_setname(),
-        )
-        return
-    if NAME_FORBIDDEN_RE.search(raw):
-        await message.answer(
-            "⚠️ ` * _ [ ] ( ) # > = | { } ! \\ ကဲ့သို့ Special Character များ မထည့်ပါနှင့်\n"
-            "ထပ်ကြိုးစားပါ",
-            reply_markup=kb_cancel_setname(),
-        )
-        return
-
-    doc = await db.get_user(user.id)
-    if not doc:
-        await state.clear()
-        return
-
-    old_alias = doc.get("n", "?")
-    result = await db.set_user_alias(user.id, raw)
-    await state.clear()
-
-    if result == "conflict":
-        await message.answer(
-            f"⚠️ **'{raw}'** — ဤ Room ထဲ တစ်ဦးမှ အသုံးပြုနေပြီဖြစ်သောကြောင့်\n"
-            f"အခြားနာမည်တစ်ခု ရွေးချယ်ပါ\n\n"
-            f"/setname ရိုက်ပြီး ထပ်ကြိုးစားပါ",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    await message.answer(
-        f"✅ **နာမည်ပြောင်းလဲပြီးပါပြီ!**\n\n"
-        f"📛 **{old_alias}** → **{raw}**",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    room_id = doc.get("r_id")
+async def exit_room(bot: Bot, user_id: int, user_doc: dict) -> None:
+    room_id = user_doc.get("r_id")
     if room_id:
-        members = await db.get_room_members(room_id, exclude_user_id=user.id)
-        for uid in members:
+        await db.remove_user_from_room(user_id, room_id)
+        await db.set_user_room(user_id, None)
+        members = await db.get_room_members(room_id)
+        for mid in members:
+            if mid != user_id:
+                try:
+                    await bot.send_message(
+                        mid,
+                        f"🔔 *{user_doc['n']}* has left the chat.",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user = await db.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+    if user["s"] == 0:
+        await message.answer("🚫 You have been banned from this service.")
+        return
+
+    if user.get("r_id"):
+        await message.answer(
+            "You are currently in a chat room. Use *🔕 Leave Chat Room* to exit first.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=CHAT_KB,
+        )
+        return
+
+    await message.answer(
+        "👋 Welcome to *Anonymous Chat*!\n\nYour alias: *{}*\n\nJoin a room to start chatting anonymously.".format(user["n"]),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=MAIN_MENU_KB,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Join chat callback
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "join_chat")
+async def cb_join_chat(cb: CallbackQuery) -> None:
+    await cb.answer()
+    user = await db.get_or_create_user(
+        cb.from_user.id,
+        cb.from_user.username,
+    )
+    if user["s"] == 0:
+        await cb.message.answer("🚫 You have been banned from this service.")
+        return
+
+    if user.get("r_id"):
+        await cb.message.answer(
+            "You are already in a chat room.",
+            reply_markup=CHAT_KB,
+        )
+        return
+
+    room_id = await db.get_or_assign_room(cb.from_user.id)
+    await db.set_user_room(cb.from_user.id, room_id)
+
+    members = await db.get_room_members(room_id)
+    member_count = len(members)
+
+    await cb.message.answer(
+        f"✅ You joined *{room_id}* as *{user['n']}*.\n👥 {member_count} user(s) in this room.\n\nSay hi — your messages are anonymous!",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=CHAT_KB,
+    )
+
+    for mid in members:
+        if mid != cb.from_user.id:
             try:
-                await bot.send_message(
-                    uid,
-                    f"🔄 **{old_alias}** — **{raw}** အဖြစ် နာမည်ပြောင်းလိုက်သည်",
+                await cb.bot.send_message(
+                    mid,
+                    f"🔔 *{user['n']}* has joined the chat.",
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception:
                 pass
 
 
-# ─── /start ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Message routing
+# ---------------------------------------------------------------------------
 
-@router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
-    if not is_private(message):
-        return
-    user = message.from_user
-    if not user:
-        return
-    doc = await db.get_or_create_user(user.id, user.username)
-
-    if doc.get("s", 1) == 0:
-        await message.answer("🚫 **သင်သည် ဤ Bot မှ Ban ကျထားပါသည်။**", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if doc.get("r_id"):
-        room_id = doc["r_id"]
-        count = await db.get_room_member_count(room_id)
+@router.message(F.text == LEAVE_TEXT)
+async def leave_room(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("r_id"):
         await message.answer(
-            f"💬 **သင် စကားဝိုင်းထဲ ရှိနေပါပြီ!**\n\n"
-            f"🏷️ သင့်အမည်: **{doc['n']}**\n"
-            f"🚪 Room: `{room_id}` · 👥 {count} ဦး\n\n"
-            f"_မက်ဆေ့ပေးပို့ရန် ရိုက်ထည့်ပါ_",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_in_room(room_id),
+            "You are not in any chat room.",
+            reply_markup=ReplyKeyboardRemove(),
         )
-        if is_admin(user.id):
-            await message.answer(
-                "🛡️ **Admin Control Panel**\n━━━━━━━━━━━━━━━━━━━━\nလုပ်ဆောင်ချက် ရွေးချယ်ပါ ↓",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_admin_panel(),
-            )
+        await message.answer(
+            "Return to the main menu whenever you're ready.",
+            reply_markup=MAIN_MENU_KB,
+        )
         return
+
+    alias = user["n"]
+    room_id = user["r_id"]
+    members = await db.get_room_members(room_id)
+
+    await db.remove_user_from_room(message.from_user.id, room_id)
+    await db.set_user_room(message.from_user.id, None)
 
     await message.answer(
-        f"👋 မင်္ဂလာပါ **{user.first_name}**!\n\n"
-        "🌐 **Anonymous Group Chat Bot** မှ ကြိုဆိုပါသည်!\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ **Bot Features:**\n\n"
-        "🎭 အမည်ဖျောက်ကာ ကမ္ဘာတစ်ဝှမ်းရှိ လူများနှင့် စကားပြောနိုင်သည်\n"
-        "💬 Text, Photo, Voice, GIF, Sticker ပို့နိုင်သည်\n"
-        "❤️ Mutual Reveal — နှစ်ဦးစလုံး ချိတ်ဆက်လိုပါက Username ထုတ်ပေးသည်\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📜 **စည်းကမ်းများ:**\n\n"
-        "🚫 Spam မပို့ရ · 🚫 ရိုင်းသောစကားများ မသုံးရ\n"
-        "✅ ပျော်ရွှင်ပြီး ရိုးသားစွာ ဆက်ဆံပါ 🙏\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 **ဝင်ရောက်ရန် ခလုတ်နှိပ်ပါ**",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_main_menu(),
+        "👋 You have left the chat room.",
+        reply_markup=ReplyKeyboardRemove(),
     )
-    if is_admin(user.id):
-        await message.answer(
-            "🛡️ **Admin Control Panel**\n━━━━━━━━━━━━━━━━━━━━\nလုပ်ဆောင်ချက် ရွေးချယ်ပါ ↓",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_admin_panel(),
-        )
-
-
-# ─── Join room ───────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "join_room")
-async def cb_join_room(cb: CallbackQuery, bot: Bot) -> None:
-    user = cb.from_user
-    if not cb.message:
-        return
-    doc = await db.get_or_create_user(user.id, user.username)
-
-    if doc.get("s", 1) == 0:
-        await cb.answer("🚫 Ban ကျထားသောကြောင့် ဝင်ခွင့်မရပါ", show_alert=True)
-        return
-    if doc.get("r_id"):
-        await cb.answer("သင် ဝင်ရောက်နေပြီဖြစ်သည်!", show_alert=True)
-        return
-
-    room_id = await db.join_room(user.id)
-    alias = doc["n"]
-    count = await db.get_room_member_count(room_id)
-
-    await cb.message.edit_text(
-        f"🎉 **စကားဝိုင်းသို့ ဝင်ရောက်ပြီးပါပြီ!**\n\n"
-        f"🏷️ သင့်အမည်: **{alias}**\n"
-        f"🚪 Room: `{room_id}` · 👥 {count} ဦး\n\n"
-        f"💬 _မက်ဆေ့ရိုက်ပြီး Enter နှိပ်ပါ_\n"
-        f"❤️ ချိတ်ဆက်ရန် **'အကောင့်ချင်းချိတ်ရန်'** နှိပ်ပါ",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_in_room(room_id),
-    )
-
-    members = await db.get_room_members(room_id, exclude_user_id=user.id)
-    for uid in members:
-        try:
-            await bot.send_message(
-                uid,
-                f"🔔 **{alias}** — Room သို့ ဝင်ရောက်လာပါပြီ! 👋\n_(ယခု {count} ဦး ရှိသည်)_",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_in_room(room_id),
-            )
-        except Exception:
-            pass
-    await cb.answer()
-
-
-# ─── Leave room ──────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("leave:"))
-async def cb_leave_room(cb: CallbackQuery, bot: Bot) -> None:
-    user = cb.from_user
-    if not cb.message:
-        return
-    doc = await db.get_user(user.id)
-    if not doc or not doc.get("r_id"):
-        await cb.answer("Room ထဲ မရှိပါ", show_alert=True)
-        return
-
-    room_id = doc["r_id"]
-    alias = doc["n"]
-    await db.leave_room(user.id)
-
-    await cb.message.edit_text(
-        "👋 **စကားဝိုင်းမှ ထွက်ပြီးပါပြီ**\n\nပြန်ဝင်ရန် `/start` ရိုက်ပါ",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    members = await db.get_room_members(room_id, exclude_user_id=user.id)
-    count = await db.get_room_member_count(room_id)
-    for uid in members:
-        try:
-            await bot.send_message(
-                uid,
-                f"🚪 **{alias}** — Room မှ ထွက်သွားပါပြီ _(ယခု {count} ဦး ကျန်သည်)_",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_in_room(room_id),
-            )
-        except Exception:
-            pass
-    await cb.answer()
-
-
-# ─── Mutual Reveal ───────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("reveal:"))
-async def cb_reveal(cb: CallbackQuery, bot: Bot) -> None:
-    user = cb.from_user
-    room_id = cb.data.split(":", 1)[1]
-
-    doc = await db.get_user(user.id)
-    if not doc or doc.get("r_id") != room_id:
-        await cb.answer("သင် ဤ Room ထဲ မရှိတော့ပါ", show_alert=True)
-        return
-
-    alias = doc["n"]
-    my_username = f"@{user.username}" if user.username else f"ID: `{user.id}`"
-
-    # Extract target alias from the message text: "[alias] 💬\ncontent"
-    msg_text = (cb.message.text or cb.message.caption or "") if cb.message else ""
-    m = ALIAS_RE.match(msg_text)
-
-    if not m:
-        # Button was clicked on a non-broadcast message (e.g. welcome/join message)
-        await cb.answer(
-            "💡 ကျေးဇူးပြု၍ သင်ချိတ်ဆက်လိုသော အဖွဲ့ဝင်၏ "
-            "စာတစ်စောင်ပေါ်ရှိ ❤️ ခလုတ်ကို တိုက်ရိုက်နှိပ်ပေးပါဗျာ။",
-            show_alert=True,
-        )
-        return
-
-    target_alias = m.group(1)
-
-    if target_alias == alias:
-        await cb.answer("ကိုယ့်ကိုကိုယ် ချိတ်မရပါ 😅", show_alert=True)
-        return
-
-    target = await db.get_user_by_alias_in_room(target_alias, room_id)
-    if not target:
-        await cb.answer(
-            "ထို User ကို ရှာမတွေ့ပါ — Room မှ ထွက်သွားပြီ ဖြစ်နိုင်သည်",
-            show_alert=True,
-        )
-        return
-
-    target_uid: int = target["_id"]
-    matched = await db.request_reveal_targeted(user.id, target_uid)
-
-    celebrate = (
-        "🎊 **MATCH ဖြစ်သွားပါပြီ!** 🎉\n\n"
-        "💫 သင်တို့နှစ်ဦးစလုံး ချိတ်ဆက်လိုကြောင်း ဆန္ဒပြပြီးပါပြီ!\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-    )
-
-    if matched:
-        target_doc = await db.get_user(target_uid)
-        matched_alias = target_doc["n"] if target_doc else target_alias
-        try:
-            matched_chat = await bot.get_chat(target_uid)
-            matched_username = (
-                f"@{matched_chat.username}" if matched_chat.username else f"ID: `{target_uid}`"
-            )
-        except Exception:
-            matched_username = f"ID: `{target_uid}`"
-
-        await bot.send_message(
-            user.id,
-            celebrate + f"🏷️ **{matched_alias}**\n📲 {matched_username}\n\n💌 Private တွင် ဆက်သွယ်နိုင်ပါပြီ! ✨",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await bot.send_message(
-            target_uid,
-            celebrate + f"🏷️ **{alias}**\n📲 {my_username}\n\n💌 Private တွင် ဆက်သွယ်နိုင်ပါပြီ! ✨",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await cb.answer("🎉 Match ဖြစ်သွားပါပြီ!", show_alert=True)
-        return
-
-    # Request sent — notify target only
-    await cb.answer(f"❤️ {target_alias} ထံ Request ပို့ပြီး!", show_alert=True)
-    try:
-        await bot.send_message(
-            target_uid,
-            f"💌 **{alias}** က သင်နှင့် ချိတ်ဆက်လိုပါသည်!\n\n"
-            f"သူ၏ စာတစ်စောင်ပေါ်ရှိ **❤️ အကောင့်ချင်းချိတ်ရန်** ခလုတ်ကို နှိပ်ပေးပါ\n"
-            f"Match ဖြစ်ပါက နှစ်ဦးစလုံး Telegram Username ထုတ်ပြပေးမည် 🎊",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        pass
-
-
-# ─── Message forwarding ──────────────────────────────────────────────────────
-
-async def _get_active_user(user_id: int, username: str | None) -> dict | None:
-    doc = await db.get_user(user_id)
-    if not doc:
-        return None
-    if doc.get("s", 1) == 0 or not doc.get("r_id"):
-        return None
-    return doc
-
-
-@router.message(StateFilter(None), F.text & ~F.text.startswith("/") & F.chat.type == "private")
-async def handle_text(message: Message, bot: Bot) -> None:
-    user = message.from_user
-    if not user:
-        return
-    doc = await _get_active_user(user.id, user.username)
-    if not doc:
-        if not (await db.get_user(user.id) or {}).get("r_id"):
-            await message.answer("💬 `/start` ရိုက်ပြီး Room ဝင်ပါ", parse_mode=ParseMode.MARKDOWN)
-        return
-    await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
-
-
-@router.message(StateFilter(None), F.photo & F.chat.type == "private")
-async def handle_photo(message: Message, bot: Bot) -> None:
-    user = message.from_user
-    if not user:
-        return
-    doc = await _get_active_user(user.id, user.username)
-    if doc:
-        await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
-
-
-@router.message(StateFilter(None), F.voice & F.chat.type == "private")
-async def handle_voice(message: Message, bot: Bot) -> None:
-    user = message.from_user
-    if not user:
-        return
-    doc = await _get_active_user(user.id, user.username)
-    if doc:
-        await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
-
-
-@router.message(StateFilter(None), F.animation & F.chat.type == "private")
-async def handle_animation(message: Message, bot: Bot) -> None:
-    user = message.from_user
-    if not user:
-        return
-    doc = await _get_active_user(user.id, user.username)
-    if doc:
-        await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
-
-
-@router.message(StateFilter(None), F.sticker & F.chat.type == "private")
-async def handle_sticker(message: Message, bot: Bot) -> None:
-    user = message.from_user
-    if not user:
-        return
-    doc = await _get_active_user(user.id, user.username)
-    if doc:
-        await broadcast_to_room(bot, doc["r_id"], user.id, doc["n"], message)
-
-
-# ─── Admin: /admin entry ─────────────────────────────────────────────────────
-
-@router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext) -> None:
-    if not is_private(message) or not message.from_user:
-        return
-    if not is_admin(message.from_user.id):
-        return
-    await state.clear()
     await message.answer(
-        "🛡️ **Admin Control Panel**\n━━━━━━━━━━━━━━━━━━━━\nလုပ်ဆောင်ချက် ရွေးချယ်ပါ ↓",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_admin_panel(),
+        "Want to join again?",
+        reply_markup=MAIN_MENU_KB,
     )
 
-
-# ─── Admin: stats ────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "admin:stats")
-async def cb_admin_stats(cb: CallbackQuery) -> None:
-    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
-        await cb.answer()
-        return
-    if cb.message.chat.type != "private":
-        await cb.answer()
-        return
-
-    stats = await db.get_stats()
-    await cb.message.edit_text(
-        "📊 **Bot Statistics**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👥 စုစုပေါင်း Registered: `{stats['total']}`\n"
-        f"✅ Active Users: `{stats['active']}`\n"
-        f"🚫 Banned Users: `{stats['banned']}`\n"
-        f"💬 In Chat Now: `{stats['in_chat']}`\n"
-        f"🚪 Active Rooms: `{stats['active_rooms']}`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_back(),
-    )
-    await cb.answer()
-
-
-# ─── Admin: userlist ─────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "admin:userlist")
-async def cb_admin_userlist(cb: CallbackQuery, bot: Bot) -> None:
-    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
-        await cb.answer()
-        return
-    if cb.message.chat.type != "private":
-        await cb.answer()
-        return
-
-    await cb.answer("📋 User List ရယူနေသည်...")
-    users = await db.get_all_users()
-
-    if not users:
-        await cb.message.edit_text(
-            "📭 **User မရှိသေးပါ**",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_back(),
-        )
-        return
-
-    lines = [f"👥 **User List** — စုစုပေါင်း `{len(users)}` ဦး\n━━━━━━━━━━━━━━━━━━━━\n"]
-    for i, u in enumerate(users, 1):
-        joined = u.get("j")
-        date_str = joined.strftime("%Y-%m-%d") if hasattr(joined, "strftime") else "N/A"
-        uname = f"@{u['u']}" if u.get("u") else "_no username_"
-        status = "✅" if u.get("s", 1) == 1 else "🚫"
-        in_chat = "💬" if u.get("r_id") else "⬜"
-        alias = u.get("n", "?")
-        lines.append(f"{i}\\. {status}{in_chat} `{u['_id']}` {uname}\n    🏷️ {alias} · {date_str}")
-
-    # Split into chunks ≤3800 chars to stay within Telegram limits
-    chunks: list[str] = []
-    current: list[str] = [lines[0]]
-    char_count = len(lines[0])
-    for line in lines[1:]:
-        if char_count + len(line) + 1 > 3800:
-            chunks.append("\n".join(current))
-            current = [line]
-            char_count = len(line)
-        else:
-            current.append(line)
-            char_count += len(line) + 1
-    if current:
-        chunks.append("\n".join(current))
-
-    for idx, chunk in enumerate(chunks):
-        if idx == len(chunks) - 1:
-            await bot.send_message(
-                cb.from_user.id, chunk,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_back(),
-            )
-        else:
-            await bot.send_message(cb.from_user.id, chunk, parse_mode=ParseMode.MARKDOWN)
-
-    # Remove the original panel message to keep chat clean
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-
-
-# ─── Admin: rooms ────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "admin:rooms")
-async def cb_admin_rooms(cb: CallbackQuery, bot: Bot) -> None:
-    await cb.answer()
-    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
-        return
-    if cb.message.chat.type != "private":
-        return
-
-    rooms = await db.get_active_rooms()
-
-    if not rooms:
-        await cb.message.edit_text(
-            "📭 **Active Room မရှိသေးပါ**",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_back(),
-        )
-        return
-
-    lines = [f"🚪 **Active Rooms** — {len(rooms)} ခု\n━━━━━━━━━━━━━━━━━━━━\n"]
-    for room in rooms:
-        aliases = "  ·  ".join(f"🏷️ {m['n']}" for m in room["members"])
-        lines.append(f"🏠 `{room['_id']}` — 👥 **{room['c']}** ဦး\n{aliases}")
-
-    chunks: list[str] = []
-    current: list[str] = [lines[0]]
-    char_count = len(lines[0])
-    for line in lines[1:]:
-        if char_count + len(line) + 2 > 3800:
-            chunks.append("\n\n".join(current))
-            current = [line]
-            char_count = len(line)
-        else:
-            current.append(line)
-            char_count += len(line) + 2
-    if current:
-        chunks.append("\n\n".join(current))
-
-    for idx, chunk in enumerate(chunks):
-        if idx == len(chunks) - 1:
-            await bot.send_message(
-                cb.from_user.id, chunk,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_back(),
-            )
-        else:
-            await bot.send_message(cb.from_user.id, chunk, parse_mode=ParseMode.MARKDOWN)
-
-    try:
-        await cb.message.delete()
-    except Exception:
-        pass
-
-
-@router.message(Command("rooms"))
-async def cmd_rooms(message: Message) -> None:
-    if not is_private(message) or not message.from_user:
-        return
-    if not is_admin(message.from_user.id):
-        return
-
-    rooms = await db.get_active_rooms()
-
-    if not rooms:
-        await message.answer("📭 **Active Room မရှိသေးပါ**", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    lines = [f"🚪 **Active Rooms** — {len(rooms)} ခု\n━━━━━━━━━━━━━━━━━━━━\n"]
-    for room in rooms:
-        aliases = "  ·  ".join(f"🏷️ {m['n']}" for m in room["members"])
-        lines.append(f"🏠 `{room['_id']}` — 👥 **{room['c']}** ဦး\n{aliases}")
-
-    await message.answer("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-# ─── Admin: broadcast ────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "admin:broadcast")
-async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext) -> None:
-    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
-        await cb.answer()
-        return
-    if cb.message.chat.type != "private":
-        await cb.answer()
-        return
-
-    await state.set_state(AdminFSM.broadcast)
-    await cb.message.edit_text(
-        "📢 **Broadcast Message**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "ပို့လိုသော **Text** သို့မဟုတ် **Photo** ပေးပို့ပါ\n"
-        "_(Active Users အားလုံးထံ ရောက်သွားမည်)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_back(),
-    )
-    await cb.answer()
-
-
-@router.message(AdminFSM.broadcast, F.chat.type == "private")
-async def handle_broadcast_input(message: Message, bot: Bot, state: FSMContext) -> None:
-    if not message.from_user or not is_admin(message.from_user.id):
-        return
-    if not message.text and not message.photo:
-        await message.answer("⚠️ Text သို့မဟုတ် Photo သာ လက်ခံသည်", reply_markup=kb_back())
-        return
-
-    user_ids = await db.get_active_user_ids()
-    status = await message.answer(
-        f"📡 **{len(user_ids)} ဦးထံ ကြော်ငြာနေသည်...**",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    ok, fail = await do_broadcast(bot, user_ids, message)
-    await state.clear()
-    await status.edit_text(
-        f"✅ **Broadcast ပြီးပါပြီ!**\n\n📤 ရောက်သည်: `{ok}` · ❌ မရောက်: `{fail}`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_admin_panel(),
-    )
-
-
-# ─── Admin: ban ──────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "admin:ban")
-async def cb_admin_ban(cb: CallbackQuery, state: FSMContext) -> None:
-    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
-        await cb.answer()
-        return
-    if cb.message.chat.type != "private":
-        await cb.answer()
-        return
-
-    await state.set_state(AdminFSM.ban)
-    await cb.message.edit_text(
-        "🔨 **User ကို Ban မည်**\n━━━━━━━━━━━━━━━━━━━━\n\nBan မည့် **User ID** ရိုက်ထည့်ပါ",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_back(),
-    )
-    await cb.answer()
-
-
-@router.message(AdminFSM.ban, F.chat.type == "private")
-async def handle_ban_input(message: Message, bot: Bot, state: FSMContext) -> None:
-    if not message.from_user or not is_admin(message.from_user.id) or not message.text:
-        return
-    if not message.text.strip().isdigit():
-        await message.answer("❌ User ID (နံပါတ်) ရိုက်ထည့်ပါ", reply_markup=kb_back())
-        return
-
-    uid = int(message.text.strip())
-    room_id = await db.ban_user(uid)
-    await state.clear()
-
-    if room_id:
-        members = await db.get_room_members(room_id, exclude_user_id=uid)
-        for mid in members:
+    for mid in members:
+        if mid != message.from_user.id:
             try:
-                await bot.send_message(mid, "🚪 Room ထဲမှ တစ်ဦး ထွက်သွားပါပြီ", parse_mode=ParseMode.MARKDOWN)
+                await message.bot.send_message(
+                    mid,
+                    f"🔔 *{alias}* has left the chat.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
             except Exception:
                 pass
 
-    try:
-        await bot.send_message(uid, "🚫 **သင်သည် Bot မှ Ban ကျပါပြီ**", parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        pass
 
-    await message.answer(
-        f"🚫 User `{uid}` ကို **Ban ပြီးပါပြီ**",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_admin_panel(),
-    )
+async def _broadcast_to_room(bot: Bot, sender_id: int, room_id: str, alias: str, message: Message) -> None:
+    members = await db.get_room_members(room_id)
+    for mid in members:
+        if mid == sender_id:
+            continue
+        try:
+            if message.text:
+                await bot.send_message(
+                    mid,
+                    f"*[{alias}]:* {message.text}",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            elif message.photo:
+                caption = f"*[{alias}]:* {message.caption}" if message.caption else f"*[{alias}]*"
+                await bot.send_photo(mid, message.photo[-1].file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            elif message.animation:
+                caption = f"*[{alias}]:* {message.caption}" if message.caption else f"*[{alias}]*"
+                await bot.send_animation(mid, message.animation.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            elif message.voice:
+                await bot.send_voice(mid, message.voice.file_id, caption=f"*[{alias}]* 🎙️", parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            log.warning("Failed to relay to %s: %s", mid, e)
 
 
-# ─── Admin: unban ────────────────────────────────────────────────────────────
+@router.message(F.text & ~F.text.startswith("/"))
+async def route_text(message: Message) -> None:
+    if message.text == LEAVE_TEXT:
+        return
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("r_id"):
+        return
+    if user["s"] == 0:
+        return
+    await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
 
-@router.callback_query(F.data == "admin:unban")
-async def cb_admin_unban(cb: CallbackQuery, state: FSMContext) -> None:
-    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
+
+@router.message(F.photo | F.animation | F.voice)
+async def route_media(message: Message) -> None:
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("r_id"):
+        return
+    if user["s"] == 0:
+        return
+    await _broadcast_to_room(message.bot, message.from_user.id, user["r_id"], user["n"], message)
+
+
+# ---------------------------------------------------------------------------
+# /admin command
+# ---------------------------------------------------------------------------
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext) -> None:
+    if not is_admin_pm(message):
+        return
+    await state.clear()
+    await message.answer("🛡️ *Admin Panel*", parse_mode=ParseMode.MARKDOWN, reply_markup=ADMIN_MENU_KB)
+
+
+# ---------------------------------------------------------------------------
+# Admin callbacks
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "adm_back")
+async def adm_back(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin_pm_cb(cb):
         await cb.answer()
         return
-    if cb.message.chat.type != "private":
+    await state.clear()
+    await cb.answer()
+    await cb.message.edit_text("🛡️ *Admin Panel*", parse_mode=ParseMode.MARKDOWN, reply_markup=ADMIN_MENU_KB)
+
+
+@router.callback_query(F.data == "adm_stats")
+async def adm_stats(cb: CallbackQuery) -> None:
+    if not is_admin_pm_cb(cb):
         await cb.answer()
         return
-
-    await state.set_state(AdminFSM.unban)
-    await cb.message.edit_text(
-        "🔓 **User ကို Unban မည်**\n━━━━━━━━━━━━━━━━━━━━\n\nUnban မည့် **User ID** ရိုက်ထည့်ပါ",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_back(),
-    )
     await cb.answer()
 
+    total = await db.count_users()
+    banned = await db.count_banned()
+    active_chat = await db.count_active_chatters()
+    rooms = await db.count_active_rooms()
 
-@router.message(AdminFSM.unban, F.chat.type == "private")
-async def handle_unban_input(message: Message, bot: Bot, state: FSMContext) -> None:
-    if not message.from_user or not is_admin(message.from_user.id) or not message.text:
-        return
-    if not message.text.strip().isdigit():
-        await message.answer("❌ User ID (နံပါတ်) ရိုက်ထည့်ပါ", reply_markup=kb_back())
-        return
+    text = (
+        "📊 *System Statistics*\n\n"
+        f"👤 Total registered users: *{total}*\n"
+        f"🚫 Banned users: *{banned}*\n"
+        f"💬 Active chatters: *{active_chat}*\n"
+        f"🏠 Active rooms: *{rooms}*"
+    )
+    await cb.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=BACK_KB)
 
-    uid = int(message.text.strip())
-    await db.unban_user(uid)
+
+@router.callback_query(F.data == "adm_broadcast")
+async def adm_broadcast_prompt(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin_pm_cb(cb):
+        await cb.answer()
+        return
+    await cb.answer()
+    await state.set_state(AdminStates.waiting_broadcast)
+    await cb.message.edit_text(
+        "📢 *Global Broadcast*\n\nSend the message (text or photo) you want to broadcast to all active users.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=BACK_KB,
+    )
+
+
+@router.message(AdminStates.waiting_broadcast)
+async def adm_do_broadcast(message: Message, state: FSMContext) -> None:
+    if not is_admin_pm(message):
+        return
     await state.clear()
 
-    try:
-        await bot.send_message(uid, "✅ **သင်သည် Unban ဖြစ်ပြီးပါပြီ!** `/start` ရိုက်ပါ", parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        pass
+    users = await db.get_all_active_users()
+    sent = 0
+    failed = 0
+
+    for user in users:
+        uid = user["_id"]
+        try:
+            if message.photo:
+                caption = message.caption or ""
+                await message.bot.send_photo(uid, message.photo[-1].file_id, caption=f"📢 {caption}")
+            elif message.text:
+                await message.bot.send_message(uid, f"📢 *Broadcast:*\n\n{message.text}", parse_mode=ParseMode.MARKDOWN)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
 
     await message.answer(
-        f"✅ User `{uid}` ကို **Unban ပြီးပါပြီ**",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_admin_panel(),
+        f"✅ Broadcast complete.\n✔️ Sent: {sent} | ❌ Failed: {failed}",
+        reply_markup=ADMIN_MENU_KB,
     )
 
 
-# ─── Admin: back ─────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "admin:back")
-async def cb_admin_back(cb: CallbackQuery, state: FSMContext) -> None:
-    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
+@router.callback_query(F.data == "adm_ban")
+async def adm_ban_prompt(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin_pm_cb(cb):
         await cb.answer()
         return
-    if cb.message.chat.type != "private":
-        await cb.answer()
-        return
-
-    await state.clear()
-    await cb.message.edit_text(
-        "🛡️ **Admin Control Panel**\n━━━━━━━━━━━━━━━━━━━━\nလုပ်ဆောင်ချက် ရွေးချယ်ပါ ↓",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_admin_panel(),
-    )
     await cb.answer()
+    await state.set_state(AdminStates.waiting_ban_id)
+    await cb.message.edit_text(
+        "🔨 *Ban User*\n\nReply with the Telegram *User ID* to ban.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=BACK_KB,
+    )
 
 
-# ─── Health server ────────────────────────────────────────────────────────────
+@router.message(AdminStates.waiting_ban_id)
+async def adm_do_ban(message: Message, state: FSMContext) -> None:
+    if not is_admin_pm(message):
+        return
 
-async def health_handler(request: web.Request) -> web.Response:
-    return web.Response(text="Anon Chat Bot is running! ✅")
+    if not message.text or not message.text.strip().lstrip("-").isdigit():
+        await message.answer("⚠️ Please send a valid numeric User ID.")
+        return
+
+    target_id = int(message.text.strip())
+    await state.clear()
+
+    target = await db.get_user(target_id)
+    if not target:
+        await message.answer("❌ User not found.", reply_markup=ADMIN_MENU_KB)
+        return
+
+    await db.ban_user(target_id)
+
+    if target.get("r_id"):
+        await exit_room(message.bot, target_id, target)
+        try:
+            await message.bot.send_message(
+                target_id,
+                "🚫 You have been banned and removed from the chat room.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except Exception:
+            pass
+
+    await message.answer(
+        f"✅ User *{target_id}* ({target.get('n', 'unknown')}) has been banned.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ADMIN_MENU_KB,
+    )
 
 
-async def run_web_server() -> None:
-    port = int(os.environ.get("PORT", 10000))
+@router.callback_query(F.data == "adm_unban")
+async def adm_unban_prompt(cb: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin_pm_cb(cb):
+        await cb.answer()
+        return
+    await cb.answer()
+    await state.set_state(AdminStates.waiting_unban_id)
+    await cb.message.edit_text(
+        "🔓 *Unban User*\n\nReply with the Telegram *User ID* to unban.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=BACK_KB,
+    )
+
+
+@router.message(AdminStates.waiting_unban_id)
+async def adm_do_unban(message: Message, state: FSMContext) -> None:
+    if not is_admin_pm(message):
+        return
+
+    if not message.text or not message.text.strip().lstrip("-").isdigit():
+        await message.answer("⚠️ Please send a valid numeric User ID.")
+        return
+
+    target_id = int(message.text.strip())
+    await state.clear()
+
+    target = await db.get_user(target_id)
+    if not target:
+        await message.answer("❌ User not found.", reply_markup=ADMIN_MENU_KB)
+        return
+
+    await db.unban_user(target_id)
+    await message.answer(
+        f"✅ User *{target_id}* ({target.get('n', 'unknown')}) has been unbanned.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ADMIN_MENU_KB,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dummy web server (port binding for Render / web service platforms)
+# ---------------------------------------------------------------------------
+
+async def dummy_web_server() -> None:
+    async def handle(_request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
     app = web.Application()
-    app.router.add_get("/", health_handler)
+    app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", DUMMY_PORT)
     await site.start()
-    logger.info("Health server on port %d", port)
-    await asyncio.Event().wait()
+    log.info("Dummy web server listening on port %s", DUMMY_PORT)
 
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-async def run_bot() -> None:
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is not set!")
-    if not any(x > 0 for x in ADMIN_IDS):
-        raise ValueError("ADMIN_IDS is not set!")
+async def main() -> None:
+    from config import BOT_TOKEN
 
-    await db.setup_indexes()
-    logger.info("Indexes ready.")
-
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Anonymous Chat Bot starting...")
+    await dummy_web_server()
+
+    log.info("Bot is starting…")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
-
-
-async def main() -> None:
-    await asyncio.gather(run_web_server(), run_bot())
 
 
 if __name__ == "__main__":
