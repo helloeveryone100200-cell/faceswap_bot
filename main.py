@@ -7,6 +7,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import SkipHandler
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -692,6 +693,9 @@ async def report_stranger(message: Message) -> None:
 async def on_private_message(message: Message, state: FSMContext) -> None:
     if not message.from_user:
         return
+    # Let dedicated Command() handlers take precedence over this catch-all relay
+    if message.text and message.text.startswith("/"):
+        raise SkipHandler()
     current_state = await state.get_state()
     if current_state in (UserStates.entering_tags.state, AdminStates.waiting_search.state,
                          AdminStates.waiting_broadcast.state, AdminStates.waiting_ban_id.state,
