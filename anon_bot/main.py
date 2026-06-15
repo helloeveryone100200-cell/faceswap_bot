@@ -57,6 +57,7 @@ def kb_in_room(room_id: str) -> InlineKeyboardMarkup:
 def kb_admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 စာရင်းဇယား ကြည့်ရန်", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="👥 User List ကြည့်ရန်", callback_data="admin:userlist")],
         [InlineKeyboardButton(text="📢 အားလုံးထံ စာပို့ရန် (Broadcast)", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="🔨 User ကို Ban မည်", callback_data="admin:ban")],
         [InlineKeyboardButton(text="🔓 User ကို Unban မည်", callback_data="admin:unban")],
@@ -419,6 +420,70 @@ async def cb_admin_stats(cb: CallbackQuery) -> None:
         reply_markup=kb_back(),
     )
     await cb.answer()
+
+
+# ─── Admin: userlist ─────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:userlist")
+async def cb_admin_userlist(cb: CallbackQuery, bot: Bot) -> None:
+    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
+        await cb.answer()
+        return
+    if cb.message.chat.type != "private":
+        await cb.answer()
+        return
+
+    await cb.answer("📋 User List ရယူနေသည်...")
+    users = await db.get_all_users()
+
+    if not users:
+        await cb.message.edit_text(
+            "📭 **User မရှိသေးပါ**",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_back(),
+        )
+        return
+
+    lines = [f"👥 **User List** — စုစုပေါင်း `{len(users)}` ဦး\n━━━━━━━━━━━━━━━━━━━━\n"]
+    for i, u in enumerate(users, 1):
+        joined = u.get("j")
+        date_str = joined.strftime("%Y-%m-%d") if hasattr(joined, "strftime") else "N/A"
+        uname = f"@{u['u']}" if u.get("u") else "_no username_"
+        status = "✅" if u.get("s", 1) == 1 else "🚫"
+        in_chat = "💬" if u.get("r_id") else "⬜"
+        alias = u.get("n", "?")
+        lines.append(f"{i}\\. {status}{in_chat} `{u['_id']}` {uname}\n    🏷️ {alias} · {date_str}")
+
+    # Split into chunks ≤3800 chars to stay within Telegram limits
+    chunks: list[str] = []
+    current: list[str] = [lines[0]]
+    char_count = len(lines[0])
+    for line in lines[1:]:
+        if char_count + len(line) + 1 > 3800:
+            chunks.append("\n".join(current))
+            current = [line]
+            char_count = len(line)
+        else:
+            current.append(line)
+            char_count += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+
+    for idx, chunk in enumerate(chunks):
+        if idx == len(chunks) - 1:
+            await bot.send_message(
+                cb.from_user.id, chunk,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_back(),
+            )
+        else:
+            await bot.send_message(cb.from_user.id, chunk, parse_mode=ParseMode.MARKDOWN)
+
+    # Remove the original panel message to keep chat clean
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
 
 
 # ─── Admin: broadcast ────────────────────────────────────────────────────────
