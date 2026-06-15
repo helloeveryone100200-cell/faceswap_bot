@@ -1,6 +1,7 @@
 import random
 from datetime import datetime, timedelta, timezone
 
+from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from config import ALIASES, MONGO_URL
@@ -27,6 +28,8 @@ async def ensure_indexes() -> None:
     db = get_db()
     await db["msg"].create_index("exp", expireAfterSeconds=0)
     await db["q"].create_index("t")
+    await db["matches"].create_index("t")
+    await db["reports"].create_index("t")
 
 
 # ---------------------------------------------------------------------------
@@ -64,13 +67,16 @@ async def get_or_create_user(user_id: int, username: str | None) -> dict:
 
 
 async def set_gender(user_id: int, gender: str) -> None:
-    """Set user gender: 'M' or 'F'."""
     await get_db()["u"].update_one({"_id": user_id}, {"$set": {"g": gender}})
 
 
 async def set_tags(user_id: int, tags: list[str]) -> None:
-    """Save up to 3 interest tags (without #) for the user."""
     await get_db()["u"].update_one({"_id": user_id}, {"$set": {"tags": tags[:3]}})
+
+
+async def set_alias(user_id: int, alias: str) -> None:
+    """Admin: force-change a user's display alias."""
+    await get_db()["u"].update_one({"_id": user_id}, {"$set": {"n": alias}})
 
 
 async def ban_user(user_id: int) -> None:
@@ -84,16 +90,11 @@ async def unban_user(user_id: int) -> None:
 
 
 async def set_temp_ban(user_id: int) -> None:
-    """Apply a 24-hour temporary ban."""
     exp = datetime.now(timezone.utc) + timedelta(hours=TEMP_BAN_HOURS)
     await get_db()["u"].update_one({"_id": user_id}, {"$set": {"s": 0, "ban_exp": exp}})
 
 
 async def lift_expired_temp_ban(user_id: int) -> bool:
-    """
-    Check if the user's temp ban has expired and lift it automatically.
-    Returns True if the user is now active (ban lifted or wasn't banned).
-    """
     user = await get_db()["u"].find_one({"_id": user_id})
     if not user:
         return False
@@ -126,36 +127,123 @@ async def get_all_active_users() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# User Management (Admin)
+# ---------------------------------------------------------------------------
+
+USERS_PER_PAGE = 5
+
+
+async def get_users_paginated(page: int) -> tuple[list[dict], int]:
+    """Return (users_on_page, total_count) sorted newest first."""
+    db = get_db()
+    total = await db["u"].count_documents({})
+    cursor = db["u"].find().sort("j", -1).skip(page * USERS_PER_PAGE).limit(USERS_PER_PAGE)
+    users = await cursor.to_list(length=USERS_PER_PAGE)
+    return users, total
+
+
+async def search_users(query: str) -> list[dict]:
+    """Search by numeric Telegram ID or by @username substring (case-insensitive)."""
+    db = get_db()
+    if query.lstrip("-").isdigit():
+        user = await db["u"].find_one({"_id": int(query)})
+        return [user] if user else []
+    cursor = db["u"].find({"u": {"$regex": query.lstrip("@"), "$options": "i"}})
+    return await cursor.to_list(length=10)
+
+
+# ---------------------------------------------------------------------------
 # Report system
 # ---------------------------------------------------------------------------
 
-async def add_report(reporter_id: int, reported_id: int) -> int:
-    """
-    Log a report and increment the reported user's count.
-    Returns the new total report count.
-    If threshold reached, applies a 24-hour temp ban automatically.
-    """
-    db = get_db()
+REPORTS_PER_PAGE = 5
 
+
+async def add_report(reporter_id: int, reported_id: int) -> int:
+    db = get_db()
     now = datetime.now(timezone.utc)
     await db["reports"].insert_one({
         "reporter": reporter_id,
         "reported": reported_id,
         "t": now,
     })
-
     result = await db["u"].find_one_and_update(
         {"_id": reported_id},
         {"$inc": {"report_count": 1}},
         return_document=True,
     )
-
     new_count = result["report_count"] if result else 1
-
     if new_count >= AUTO_BAN_REPORT_THRESHOLD:
         await set_temp_ban(reported_id)
-
     return new_count
+
+
+async def get_reports_paginated(page: int) -> tuple[list[dict], int]:
+    """Return (reports_on_page, total_count) sorted newest first."""
+    db = get_db()
+    total = await db["reports"].count_documents({})
+    cursor = db["reports"].find().sort("t", -1).skip(page * REPORTS_PER_PAGE).limit(REPORTS_PER_PAGE)
+    reports = await cursor.to_list(length=REPORTS_PER_PAGE)
+    return reports, total
+
+
+async def dismiss_report(report_id_str: str) -> None:
+    """Delete a single report document by its ObjectId string."""
+    await get_db()["reports"].delete_one({"_id": ObjectId(report_id_str)})
+
+
+async def clear_user_reports(user_id: int) -> None:
+    """Delete all reports against a user and reset their report_count."""
+    await get_db()["reports"].delete_many({"reported": user_id})
+    await get_db()["u"].update_one({"_id": user_id}, {"$set": {"report_count": 0}})
+
+
+async def count_reports_total() -> int:
+    return await get_db()["reports"].count_documents({})
+
+
+# ---------------------------------------------------------------------------
+# Match logging  (collection: 'matches')
+# ---------------------------------------------------------------------------
+
+async def log_match(user_a_id: int, user_b_id: int) -> None:
+    await get_db()["matches"].insert_one({
+        "u": [user_a_id, user_b_id],
+        "t": datetime.now(timezone.utc),
+    })
+
+
+async def count_matches_total() -> int:
+    return await get_db()["matches"].count_documents({})
+
+
+# ---------------------------------------------------------------------------
+# Advanced Stats helpers
+# ---------------------------------------------------------------------------
+
+def _today_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def count_new_users_today() -> int:
+    return await get_db()["u"].count_documents({"j": {"$gte": _today_start()}})
+
+
+async def count_matches_today() -> int:
+    return await get_db()["matches"].count_documents({"t": {"$gte": _today_start()}})
+
+
+async def count_reports_today() -> int:
+    return await get_db()["reports"].count_documents({"t": {"$gte": _today_start()}})
+
+
+async def count_temp_banned() -> int:
+    now = datetime.now(timezone.utc)
+    return await get_db()["u"].count_documents({
+        "s": 0,
+        "ban_exp": {"$gt": now},
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +273,7 @@ async def leave_queue(user_id: int) -> None:
 
 
 async def is_in_queue(user_id: int) -> bool:
-    doc = await get_db()["q"].find_one({"_id": user_id})
-    return doc is not None
+    return await get_db()["q"].find_one({"_id": user_id}) is not None
 
 
 async def get_queue_entry(user_id: int) -> dict | None:
@@ -200,16 +287,6 @@ async def find_and_match(
     user_tags: list[str],
     strict: bool = True,
 ) -> int | None:
-    """
-    Try to find and atomically match a partner from the queue.
-
-    If strict=True:  require at least one shared tag (falls back to gender-only if no tags).
-    If strict=False: match by gender only (no tag requirement).
-
-    Gender compatibility rules:
-      - My target_gender must match partner's gender (or target is 'any').
-      - Partner's target_gender must match my gender (or partner's target is 'any').
-    """
     db = get_db()
 
     def _gender_query() -> dict:
@@ -251,17 +328,6 @@ async def count_waiting() -> int:
 
 # ---------------------------------------------------------------------------
 # Message copy tracking  (collection: 'msg')
-#
-# Schema:
-#   _id : str                 — 8-char URL-safe key
-#   c   : [[int, int], ...]   — ALL copies: [[chat_id, msg_id], ...]
-#                               includes SENDER's original message too
-#   exp : datetime            — TTL field; MongoDB auto-deletes after 24 h
-#
-# Storing the sender's original enables:
-#   - Reaction mirroring (existing)
-#   - Reply sync: bot replies to sender's original when partner uses Telegram reply
-#   - Edit sync: bot edits relayed copy when sender edits their message
 # ---------------------------------------------------------------------------
 
 async def create_msg(key: str, copies: list[list[int]]) -> None:
