@@ -75,6 +75,7 @@ def kb_admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 စာရင်းဇယား ကြည့်ရန်", callback_data="admin:stats")],
         [InlineKeyboardButton(text="👥 User List ကြည့်ရန်", callback_data="admin:userlist")],
+        [InlineKeyboardButton(text="🚪 Active Rooms ကြည့်ရန်", callback_data="admin:rooms")],
         [InlineKeyboardButton(text="📢 အားလုံးထံ စာပို့ရန် (Broadcast)", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="🔨 User ကို Ban မည်", callback_data="admin:ban")],
         [InlineKeyboardButton(text="🔓 User ကို Unban မည်", callback_data="admin:unban")],
@@ -229,13 +230,20 @@ async def cb_cancel_setname(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
-@router.message(UserFSM.setname, F.text & F.chat.type == "private")
+@router.message(UserFSM.setname)
 async def handle_setname_input(message: Message, state: FSMContext, bot: Bot) -> None:
     user = message.from_user
-    if not user:
+    if not user or message.chat.type != "private":
+        return
+    if not message.text:
+        await message.answer(
+            "⚠️ ကျေးဇူးပြု၍ **စာသား** ရိုက်ထည့်ပါ",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_cancel_setname(),
+        )
         return
 
-    raw = (message.text or "").strip()
+    raw = message.text.strip()
 
     if len(raw) < NAME_MIN:
         await message.answer(
@@ -693,6 +701,82 @@ async def cb_admin_userlist(cb: CallbackQuery, bot: Bot) -> None:
         await cb.message.delete()
     except Exception:
         pass
+
+
+# ─── Admin: rooms ────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:rooms")
+async def cb_admin_rooms(cb: CallbackQuery, bot: Bot) -> None:
+    await cb.answer()
+    if not cb.from_user or not is_admin(cb.from_user.id) or not cb.message:
+        return
+    if cb.message.chat.type != "private":
+        return
+
+    rooms = await db.get_active_rooms()
+
+    if not rooms:
+        await cb.message.edit_text(
+            "📭 **Active Room မရှိသေးပါ**",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_back(),
+        )
+        return
+
+    lines = [f"🚪 **Active Rooms** — {len(rooms)} ခု\n━━━━━━━━━━━━━━━━━━━━\n"]
+    for room in rooms:
+        aliases = "  ·  ".join(f"🏷️ {m['n']}" for m in room["members"])
+        lines.append(f"🏠 `{room['_id']}` — 👥 **{room['c']}** ဦး\n{aliases}")
+
+    chunks: list[str] = []
+    current: list[str] = [lines[0]]
+    char_count = len(lines[0])
+    for line in lines[1:]:
+        if char_count + len(line) + 2 > 3800:
+            chunks.append("\n\n".join(current))
+            current = [line]
+            char_count = len(line)
+        else:
+            current.append(line)
+            char_count += len(line) + 2
+    if current:
+        chunks.append("\n\n".join(current))
+
+    for idx, chunk in enumerate(chunks):
+        if idx == len(chunks) - 1:
+            await bot.send_message(
+                cb.from_user.id, chunk,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_back(),
+            )
+        else:
+            await bot.send_message(cb.from_user.id, chunk, parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+
+@router.message(Command("rooms"))
+async def cmd_rooms(message: Message) -> None:
+    if not is_private(message) or not message.from_user:
+        return
+    if not is_admin(message.from_user.id):
+        return
+
+    rooms = await db.get_active_rooms()
+
+    if not rooms:
+        await message.answer("📭 **Active Room မရှိသေးပါ**", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    lines = [f"🚪 **Active Rooms** — {len(rooms)} ခု\n━━━━━━━━━━━━━━━━━━━━\n"]
+    for room in rooms:
+        aliases = "  ·  ".join(f"🏷️ {m['n']}" for m in room["members"])
+        lines.append(f"🏠 `{room['_id']}` — 👥 **{room['c']}** ဦး\n{aliases}")
+
+    await message.answer("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # ─── Admin: broadcast ────────────────────────────────────────────────────────
