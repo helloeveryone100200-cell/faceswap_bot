@@ -162,6 +162,22 @@ async def count_active_chatters() -> int:
     return await get_db()["u"].count_documents({"p_id": {"$ne": None}, "s": 1})
 
 
+async def count_active_by_mode(mode: str) -> int:
+    """Count users actively waiting or chatting in a given mode.
+
+    Uses two fast indexed queries instead of a heavy aggregation:
+      • Waiting  — entries in the 'q' (queue) collection with matching mode.
+      • Chatting — users in 'u' who have a partner AND whose chat_mode matches.
+    Both queries hit small collections and use existing indexes.
+    """
+    database = get_db()
+    waiting  = await database["q"].count_documents({"mode": mode})
+    chatting = await database["u"].count_documents(
+        {"p_id": {"$ne": None}, "chat_mode": mode, "s": 1}
+    )
+    return waiting + chatting
+
+
 async def count_temp_banned() -> int:
     now = datetime.now(timezone.utc)
     return await get_db()["u"].count_documents({"s": 0, "ban_exp": {"$gt": now}})
