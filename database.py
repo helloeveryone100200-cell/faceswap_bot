@@ -30,6 +30,7 @@ async def ensure_indexes() -> None:
     await db["q"].create_index("t")
     await db["matches"].create_index("t")
     await db["reports"].create_index("t")
+    # sessions collection: no extra index needed (_id is the primary key)
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +164,6 @@ async def count_active_chatters() -> int:
 
 
 async def count_active_by_mode(mode: str) -> int:
-    """Count users actively waiting or chatting in a given mode.
-
-    Uses two fast indexed queries instead of a heavy aggregation:
-      • Waiting  — entries in the 'q' (queue) collection with matching mode.
-      • Chatting — users in 'u' who have a partner AND whose chat_mode matches.
-    Both queries hit small collections and use existing indexes.
-    """
     database = get_db()
     waiting  = await database["q"].count_documents({"mode": mode})
     chatting = await database["u"].count_documents(
@@ -355,21 +349,18 @@ async def find_and_match(
         return q
 
     if strict and user_tags:
-        # Prefer high-karma users with shared tags
         q = _base_q()
         q["tags"] = {"$in": user_tags}
         q["karma"] = {"$gte": max(0, user_karma - 5)}
         match = await db["q"].find_one_and_delete(q)
         if match:
             return match["_id"]
-        # Any karma, with tags
         q2 = _base_q()
         q2["tags"] = {"$in": user_tags}
         match = await db["q"].find_one_and_delete(q2)
         if match:
             return match["_id"]
 
-    # Gender + mode match, any tags
     match = await db["q"].find_one_and_delete(_base_q())
     if match:
         return match["_id"]
@@ -401,3 +392,62 @@ async def create_msg(key: str, copies: list[list[int]]) -> None:
 
 async def find_msg_by_copy(chat_id: int, msg_id: int) -> dict | None:
     return await get_db()["msg"].find_one({"c": [chat_id, msg_id]})
+
+
+# ---------------------------------------------------------------------------
+# Session tracking  (collection: 'sessions')
+#
+# Tracks two things per user:
+#   search_msg : int | None  — message_id of the "Searching..." status message
+#                               deleted as soon as the user is matched or cancels
+#   start      : int | None  — message_id of the first bot-sent message in the
+#                               current 1-on-1 chat (the "Connected!" notification)
+#   last       : int | None  — message_id of the most-recently relayed message
+#                               updated on every relay; used as end of delete range
+#
+# On disconnect, the range [start, last] is bulk-deleted for both users, then
+# the session doc is erased entirely (zero DB footprint after cleanup).
+# ---------------------------------------------------------------------------
+
+async def save_search_msg(user_id: int, msg_id: int) -> None:
+    """Store the 'Searching...' status message ID for later cleanup."""
+    await get_db()["sessions"].update_one(
+        {"_id": user_id},
+        {"$set": {"search_msg": msg_id}},
+        upsert=True,
+    )
+
+
+async def get_search_msg(user_id: int) -> int | None:
+    """Return the stored search status message ID, or None."""
+    doc = await get_db()["sessions"].find_one({"_id": user_id})
+    return doc.get("search_msg") if doc else None
+
+
+async def set_chat_start(user_id: int, msg_id: int) -> None:
+    """Record the first bot-sent message of a 1-on-1 chat session.
+    Clears search_msg at the same time (it has just been deleted)."""
+    await get_db()["sessions"].update_one(
+        {"_id": user_id},
+        {"$set": {"start": msg_id, "last": msg_id, "search_msg": None}},
+        upsert=True,
+    )
+
+
+async def update_chat_last(user_id: int, msg_id: int) -> None:
+    """Slide the high-water mark forward each time a message is relayed."""
+    await get_db()["sessions"].update_one(
+        {"_id": user_id},
+        {"$set": {"last": msg_id}},
+        upsert=True,
+    )
+
+
+async def get_session(user_id: int) -> dict | None:
+    """Return the full session doc for a user."""
+    return await get_db()["sessions"].find_one({"_id": user_id})
+
+
+async def clear_session(user_id: int) -> None:
+    """Erase a user's session record (called after bulk deletion completes)."""
+    await get_db()["sessions"].delete_one({"_id": user_id})
