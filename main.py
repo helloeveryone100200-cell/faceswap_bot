@@ -123,26 +123,26 @@ GIFTS: list[tuple[str, str]] = [
 
 GIFT_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
-        InlineKeyboardButton(text="☕ Coffee",     callback_data="gft_0"),
+        InlineKeyboardButton(text="☕ Coffee",      callback_data="gft_0"),
         InlineKeyboardButton(text="🧋 Bubble Tea",  callback_data="gft_1"),
     ],
     [
-        InlineKeyboardButton(text="🍦 Ice Cream",  callback_data="gft_2"),
-        InlineKeyboardButton(text="🍕 Pizza",      callback_data="gft_3"),
+        InlineKeyboardButton(text="🍦 Ice Cream",   callback_data="gft_2"),
+        InlineKeyboardButton(text="🍕 Pizza",       callback_data="gft_3"),
     ],
     [
-        InlineKeyboardButton(text="🌹 Rose",       callback_data="gft_4"),
-        InlineKeyboardButton(text="❤️ Heart",      callback_data="gft_5"),
+        InlineKeyboardButton(text="🌹 Rose",        callback_data="gft_4"),
+        InlineKeyboardButton(text="❤️ Heart",       callback_data="gft_5"),
     ],
     [
-        InlineKeyboardButton(text="🍫 Chocolate",  callback_data="gft_6"),
-        InlineKeyboardButton(text="🧸 Teddy Bear", callback_data="gft_7"),
+        InlineKeyboardButton(text="🍫 Chocolate",   callback_data="gft_6"),
+        InlineKeyboardButton(text="🧸 Teddy Bear",  callback_data="gft_7"),
     ],
     [
-        InlineKeyboardButton(text="✨ Magic Star",  callback_data="gft_8"),
-        InlineKeyboardButton(text="🎉 Party Popper",callback_data="gft_9"),
+        InlineKeyboardButton(text="✨ Magic Star",   callback_data="gft_8"),
+        InlineKeyboardButton(text="🎉 Party Popper", callback_data="gft_9"),
     ],
-    [InlineKeyboardButton(text="❌ Cancel",        callback_data="gft_cancel")],
+    [InlineKeyboardButton(text="❌ Cancel",          callback_data="gft_cancel")],
 ])
 
 # ---------------------------------------------------------------------------
@@ -150,10 +150,11 @@ GIFT_KB = InlineKeyboardMarkup(inline_keyboard=[
 # ---------------------------------------------------------------------------
 
 MAIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🔍 Find a Stranger", callback_data="find_stranger")],
+    [InlineKeyboardButton(text="🔍 Find a Stranger",     callback_data="find_stranger")],
     [InlineKeyboardButton(text="🏷️ My Interests / Tags", callback_data="my_tags")],
-    [InlineKeyboardButton(text="👤 My Profile", callback_data="my_profile")],
+    [InlineKeyboardButton(text="👤 My Profile",          callback_data="my_profile")],
 ])
+
 
 def _mode_select_kb() -> InlineKeyboardMarkup:
     """Returns mode-select keyboard with live cached active-user counts."""
@@ -169,25 +170,25 @@ def _mode_select_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Back", callback_data="go_main_menu")],
     ])
 
+
 GENDER_SELECT_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text="Male 👦",   callback_data="gender_m"),
         InlineKeyboardButton(text="Female 👧", callback_data="gender_f"),
     ],
-    [InlineKeyboardButton(text="⬅️ Back",    callback_data="go_main_menu")],
+    [InlineKeyboardButton(text="⬅️ Back", callback_data="go_main_menu")],
 ])
 
 
 def _target_gender_kb(mode: str) -> InlineKeyboardMarkup:
-    """Returns a target-gender keyboard with mode encoded in callback."""
     m = "n" if mode == "normal" else "a"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Anyone 🌐",    callback_data=f"find_{m}_any")],
+        [InlineKeyboardButton(text="Anyone 🌐",     callback_data=f"find_{m}_any")],
         [
             InlineKeyboardButton(text="Find Boys 👦",  callback_data=f"find_{m}_m"),
             InlineKeyboardButton(text="Find Girls 👧", callback_data=f"find_{m}_f"),
         ],
-        [InlineKeyboardButton(text="⬅️ Back",      callback_data="go_mode_select")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="go_mode_select")],
     ])
 
 
@@ -248,8 +249,8 @@ _rated: set[tuple[int, int]] = set()
 
 def _rating_kb(partner_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="👍 Good Chat",  callback_data=f"rate_up_{partner_id}"),
-        InlineKeyboardButton(text="👎 Bored",      callback_data=f"rate_dn_{partner_id}"),
+        InlineKeyboardButton(text="👍 Good Chat", callback_data=f"rate_up_{partner_id}"),
+        InlineKeyboardButton(text="👎 Bored",     callback_data=f"rate_dn_{partner_id}"),
     ]])
 
 
@@ -326,8 +327,8 @@ def _user_action_kb(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔨 Ban",   callback_data=f"ub_{s}"),
             InlineKeyboardButton(text="🔓 Unban", callback_data=f"uu_{s}"),
         ],
-        [InlineKeyboardButton(text="✏️ Change Alias",   callback_data=f"ua_{s}")],
-        [InlineKeyboardButton(text="🗑️ Clear Reports",  callback_data=f"ucr_{s}")],
+        [InlineKeyboardButton(text="✏️ Change Alias",  callback_data=f"ua_{s}")],
+        [InlineKeyboardButton(text="🗑️ Clear Reports", callback_data=f"ucr_{s}")],
         [InlineKeyboardButton(text="⬅️ Back to Admin Panel", callback_data="adm_back")],
     ])
 
@@ -346,9 +347,60 @@ def _pagination_kb(current_page: int, total: int, per_page: int, prefix: str) ->
     ])
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# UI / Message Cleanup Helpers
+# ===========================================================================
+
+async def _try_delete(bot: Bot, chat_id: int, msg_id: int) -> None:
+    """Silently delete a single message. Never raises."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception:
+        pass
+
+
+async def _delete_search_msg(bot: Bot, user_id: int) -> None:
+    """Delete the stored 'Searching...' status message for a user."""
+    msg_id = await db.get_search_msg(user_id)
+    if msg_id:
+        await _try_delete(bot, user_id, msg_id)
+
+
+async def _bulk_delete_chat(
+    bot: Bot, user_id: int,
+    start_msg_id: int | None,
+    end_msg_id: int | None,
+) -> None:
+    """
+    Range-delete all bot messages in [start_msg_id, end_msg_id] from a user's chat.
+
+    Uses batched asyncio.gather (25 at a time) to stay within Telegram rate limits.
+    Messages the bot never sent (user's own messages, already-deleted messages) are
+    skipped silently — the try/except inside _try_delete handles every exception.
+    """
+    if not start_msg_id or not end_msg_id or end_msg_id < start_msg_id:
+        return
+    all_ids = list(range(start_msg_id, end_msg_id + 1))
+    BATCH = 25
+    for i in range(0, len(all_ids), BATCH):
+        batch = all_ids[i : i + BATCH]
+        await asyncio.gather(
+            *[_try_delete(bot, user_id, mid) for mid in batch],
+            return_exceptions=True,
+        )
+
+
+async def _bg_update_last(user_id: int, msg_id: int) -> None:
+    """Background task: slide the session's last-message pointer forward."""
+    try:
+        await db.update_chat_last(user_id, msg_id)
+    except Exception:
+        pass
+
+
+# ===========================================================================
 # Core chat helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 async def _connect_strangers(bot: Bot, user_a_id: int, user_b_id: int, mode: str = "normal") -> None:
     import random
@@ -368,6 +420,13 @@ async def _connect_strangers(bot: Bot, user_a_id: int, user_b_id: int, mode: str
     if not user_a or not user_b:
         return
 
+    # ── Delete any stale "Searching..." status messages ──────────────────────
+    await asyncio.gather(
+        _delete_search_msg(bot, user_a_id),
+        _delete_search_msg(bot, user_b_id),
+        return_exceptions=True,
+    )
+
     icebreaker = random.choice(ICEBREAKERS)
     mode_tag = " 🔥 <i>Adult Mode</i>" if mode == "adult" else " 🌐 <i>Normal Mode</i>"
     tpl = (
@@ -376,14 +435,18 @@ async def _connect_strangers(bot: Bot, user_a_id: int, user_b_id: int, mode: str
         "🧊 <b>Icebreaker:</b> <i>{ice}</i>\n\n"
         "Start chatting! Use <b>🎁 Send Gift</b> to surprise your partner."
     )
+
+    # ── Send "Connected!" and record start_msg_id for range deletion ──────────
     for (me_id, partner) in [(user_a_id, user_b), (user_b_id, user_a)]:
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 me_id,
                 tpl.format(mode_tag=mode_tag, name=partner["n"],
                            icon=_gender_label(partner), ice=icebreaker),
                 parse_mode=ParseMode.HTML, reply_markup=STRANGER_KB,
             )
+            # Record this message as the start of the deletable chat range
+            await db.set_chat_start(me_id, sent.message_id)
         except Exception as e:
             log.warning("connect notify %s failed: %s", me_id, e)
 
@@ -393,11 +456,37 @@ async def _disconnect_stranger(
     notify_partner: bool = True,
     send_rating: bool = False,
 ) -> None:
-    await db.set_partner(user_id, None)
-    await db.set_partner(partner_id, None)
-    await db.set_chat_mode(user_id, None)
-    await db.set_chat_mode(partner_id, None)
+    # ── Snapshot session data BEFORE clearing (needed for range deletion) ─────
+    sess_user, sess_partner = await asyncio.gather(
+        db.get_session(user_id),
+        db.get_session(partner_id),
+    )
 
+    # ── Clear partner / mode links in DB ─────────────────────────────────────
+    await asyncio.gather(
+        db.set_partner(user_id, None),
+        db.set_partner(partner_id, None),
+        db.set_chat_mode(user_id, None),
+        db.set_chat_mode(partner_id, None),
+    )
+
+    # ── Erase session records (DB stays lean after every chat) ───────────────
+    await asyncio.gather(
+        db.clear_session(user_id),
+        db.clear_session(partner_id),
+    )
+
+    # ── Fire bulk-delete tasks in the background (non-blocking) ──────────────
+    if sess_user and sess_user.get("start") and sess_user.get("last"):
+        asyncio.create_task(
+            _bulk_delete_chat(bot, user_id, sess_user["start"], sess_user["last"])
+        )
+    if sess_partner and sess_partner.get("start") and sess_partner.get("last"):
+        asyncio.create_task(
+            _bulk_delete_chat(bot, partner_id, sess_partner["start"], sess_partner["last"])
+        )
+
+    # ── Notify disconnected partner ───────────────────────────────────────────
     if notify_partner:
         try:
             await bot.send_message(partner_id, "🔌 Your chat partner has disconnected.",
@@ -434,11 +523,15 @@ async def _do_find(bot: Bot, user_id: int, target_gender: str, mode: str = "norm
 
     waiting = await db.count_waiting()
     mode_label = "🔥 Adult Mode" if mode == "adult" else "🌐 Normal Mode"
-    await bot.send_message(
+
+    # ── Send "Searching..." and save the message_id for later cleanup ─────────
+    search_msg = await bot.send_message(
         user_id,
         f"🔍 Searching [{mode_label}]… ({waiting} in queue)\n\nUse <b>🔚 Stop Chat</b> to cancel.",
         parse_mode=ParseMode.HTML, reply_markup=STRANGER_KB,
     )
+    await db.save_search_msg(user_id, search_msg.message_id)
+
     asyncio.create_task(_fallback_match(bot, user_id, mode))
 
 
@@ -469,11 +562,13 @@ async def _fallback_match(bot: Bot, user_id: int, mode: str) -> None:
         return
     try:
         waiting = await db.count_waiting()
-        await bot.send_message(
+        still_msg = await bot.send_message(
             user_id,
             f"⏳ Still searching… ({waiting} in queue)\nUse <b>🔚 Stop Chat</b> to cancel.",
             parse_mode=ParseMode.HTML,
         )
+        # Update stored search_msg so the new status message gets cleaned up too
+        await db.save_search_msg(user_id, still_msg.message_id)
     except Exception:
         pass
 
@@ -558,6 +653,8 @@ async def _send_to_stranger(
                                 reply_to_partner_msg_id, spoiler=spoiler)
     if sent:
         await db.create_msg(msg_key, [[sender_id, sender_msg_id], [partner_id, sent.message_id]])
+        # Slide the partner's session last-message pointer forward (background — non-blocking)
+        asyncio.create_task(_bg_update_last(partner_id, sent.message_id))
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +753,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Global navigation callbacks — back buttons used across all screens
+# Global navigation callbacks
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "go_main_menu")
@@ -711,7 +808,6 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     prompt_msg_id = data.get("prompt_msg_id")
     await state.clear()
-    # Try to delete user's typed message
     try:
         await message.delete()
     except Exception:
@@ -769,13 +865,12 @@ async def cb_my_profile(cb: CallbackQuery) -> None:
 
 
 async def _show_profile(edit_or_send, user: dict) -> None:
-    alias   = user.get("n", "—")
-    gender  = _gender_label(user)
-    tags    = " ".join(f"#{t}" for t in user.get("tags", [])) or "No tags set"
-    karma   = user.get("karma_points", 0)
-    streak  = user.get("streak", 0)
+    alias      = user.get("n", "—")
+    gender     = _gender_label(user)
+    tags       = " ".join(f"#{t}" for t in user.get("tags", [])) or "No tags set"
+    karma      = user.get("karma_points", 0)
+    streak     = user.get("streak", 0)
     streak_txt = f"{streak} 🔥" if streak > 0 else "—"
-
     text = (
         f"👤 <b>Your Profile</b>\n\n"
         f"🏷️ Alias:   <b>{alias}</b>\n"
@@ -785,10 +880,10 @@ async def _show_profile(edit_or_send, user: dict) -> None:
         f"🔥 Streak:  <b>{streak_txt}</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Change Alias",   callback_data="prof_alias")],
-        [InlineKeyboardButton(text="🔄 Change Gender",  callback_data="prof_gender")],
-        [InlineKeyboardButton(text="🏷️ Update Tags",    callback_data="my_tags")],
-        [InlineKeyboardButton(text="🏠 Main Menu",      callback_data="prof_back")],
+        [InlineKeyboardButton(text="✏️ Change Alias",  callback_data="prof_alias")],
+        [InlineKeyboardButton(text="🔄 Change Gender", callback_data="prof_gender")],
+        [InlineKeyboardButton(text="🏷️ Update Tags",   callback_data="my_tags")],
+        [InlineKeyboardButton(text="🏠 Main Menu",     callback_data="prof_back")],
     ])
     await edit_or_send(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -811,8 +906,7 @@ async def cb_prof_alias(cb: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ProfileStates.changing_alias)
     await state.update_data(prompt_msg_id=cb.message.message_id)
     await cb.message.edit_text(
-        "✏️ Send your <b>new alias</b> (any text).\n\n"
-        "Send /cancel to go back.",
+        "✏️ Send your <b>new alias</b> (any text).\n\nSend /cancel to go back.",
         parse_mode=ParseMode.HTML)
 
 
@@ -1005,6 +1099,9 @@ async def stop_chat(message: Message) -> None:
         return
     if await db.is_in_queue(message.from_user.id):
         await db.leave_queue(message.from_user.id)
+        # Clean up "Searching..." message
+        asyncio.create_task(_delete_search_msg(message.bot, message.from_user.id))
+        await db.clear_session(message.from_user.id)
         await message.answer("🔚 Search cancelled.", reply_markup=ReplyKeyboardRemove())
         await message.answer("Want to try again?", reply_markup=MAIN_MENU_KB)
         return
@@ -1031,7 +1128,11 @@ async def next_stranger(message: Message) -> None:
     if partner_id:
         await _disconnect_stranger(message.bot, message.from_user.id, partner_id,
                                    notify_partner=True, send_rating=False)
-    await db.leave_queue(message.from_user.id)
+    else:
+        # Was queuing — cancel and clean search msg
+        await db.leave_queue(message.from_user.id)
+        asyncio.create_task(_delete_search_msg(message.bot, message.from_user.id))
+        await db.clear_session(message.from_user.id)
     await message.answer("🔍 Finding next stranger…")
     await _do_find(message.bot, message.from_user.id, "any")
 
@@ -1118,10 +1219,10 @@ async def cb_send_gift(cb: CallbackQuery) -> None:
 @router.callback_query(F.data.regexp(r"^rate_(up|dn)_\d+$"))
 async def cb_rate(cb: CallbackQuery) -> None:
     await cb.answer()
-    parts     = cb.data.split("_")
-    direction = parts[1]
+    parts      = cb.data.split("_")
+    direction  = parts[1]
     partner_id = int(parts[2])
-    rater_id  = cb.from_user.id
+    rater_id   = cb.from_user.id
 
     if (rater_id, partner_id) in _rated:
         await cb.answer("You already rated this conversation.", show_alert=True)
@@ -1138,7 +1239,7 @@ async def cb_rate(cb: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main relay — NOTE: filter excludes commands so they reach their own handlers
+# Main relay — filter excludes commands so they reach their own handlers
 # ---------------------------------------------------------------------------
 
 @router.message(F.chat.type == "private", ~F.text.regexp(r"^/"))
@@ -1232,16 +1333,19 @@ async def adm_stats(cb: CallbackQuery) -> None:
         await cb.answer()
         return
     await cb.answer("Loading…")
-    total       = await db.count_users()
-    banned      = await db.count_banned()
-    temp_banned = await db.count_temp_banned()
-    active_chat = await db.count_active_chatters()
-    waiting     = await db.count_waiting()
-    total_match = await db.count_matches_total()
-    total_rep   = await db.count_reports_total()
-    new_today   = await db.count_new_users_today()
-    match_today = await db.count_matches_today()
-    rep_today   = await db.count_reports_today()
+    total, banned, temp_banned, active_chat, waiting, total_match, total_rep, \
+        new_today, match_today, rep_today = await asyncio.gather(
+        db.count_users(),
+        db.count_banned(),
+        db.count_temp_banned(),
+        db.count_active_chatters(),
+        db.count_waiting(),
+        db.count_matches_total(),
+        db.count_reports_total(),
+        db.count_new_users_today(),
+        db.count_matches_today(),
+        db.count_reports_today(),
+    )
     perm_banned = banned - temp_banned
     text = (
         "📈 <b>Advanced System Statistics</b>\n\n"
@@ -1282,7 +1386,8 @@ async def adm_user_list(cb: CallbackQuery) -> None:
     user_buttons = []
     for u in users:
         uname = f"@{u['u']}" if u.get("u") else "—"
-        lines.append(f"• <b>{u['n']}</b> {_gender_label(u)} | <code>{u['_id']}</code> | {uname} | {_status_label(u)}")
+        lines.append(
+            f"• <b>{u['n']}</b> {_gender_label(u)} | <code>{u['_id']}</code> | {uname} | {_status_label(u)}")
         user_buttons.append([InlineKeyboardButton(
             text=f"{u['n']} {_gender_label(u)}", callback_data=f"uv_{u['_id']}")])
     pagination = _pagination_kb(page, total, db.USERS_PER_PAGE, "ul")
