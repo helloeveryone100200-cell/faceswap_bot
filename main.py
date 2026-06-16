@@ -32,6 +32,26 @@ log = logging.getLogger(__name__)
 router = Router()
 
 # ---------------------------------------------------------------------------
+# Live active-user cache  (refreshed every 60 s by background loop)
+# ---------------------------------------------------------------------------
+
+GLOBAL_NORMAL_ACTIVE: int = 0
+GLOBAL_ADULT_ACTIVE:  int = 0
+
+
+async def _refresh_active_counts() -> None:
+    """Background loop: query MongoDB once per minute, update in-memory cache."""
+    global GLOBAL_NORMAL_ACTIVE, GLOBAL_ADULT_ACTIVE
+    while True:
+        try:
+            GLOBAL_NORMAL_ACTIVE = await db.count_active_by_mode("normal")
+            GLOBAL_ADULT_ACTIVE  = await db.count_active_by_mode("adult")
+        except Exception as _exc:
+            log.warning("Active-count cache refresh failed: %s", _exc)
+        await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
 
@@ -135,11 +155,19 @@ MAIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="👤 My Profile", callback_data="my_profile")],
 ])
 
-MODE_SELECT_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="Normal Mode 🌐",    callback_data="ms_normal")],
-    [InlineKeyboardButton(text="18+ Adult Mode 🔥", callback_data="ms_adult")],
-    [InlineKeyboardButton(text="⬅️ Back",           callback_data="go_main_menu")],
-])
+def _mode_select_kb() -> InlineKeyboardMarkup:
+    """Returns mode-select keyboard with live cached active-user counts."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🌐 Normal Mode ({GLOBAL_NORMAL_ACTIVE} Active)",
+            callback_data="ms_normal",
+        )],
+        [InlineKeyboardButton(
+            text=f"🔥 18+ Adult Mode ({GLOBAL_ADULT_ACTIVE} Active)",
+            callback_data="ms_adult",
+        )],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="go_main_menu")],
+    ])
 
 GENDER_SELECT_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
@@ -654,9 +682,9 @@ async def cb_go_main_menu(cb: CallbackQuery, state: FSMContext) -> None:
 async def cb_go_mode_select(cb: CallbackQuery) -> None:
     await cb.answer()
     try:
-        await cb.message.edit_text("Choose your chat mode:", reply_markup=MODE_SELECT_KB)
+        await cb.message.edit_text("Choose your chat mode:", reply_markup=_mode_select_kb())
     except Exception:
-        await cb.message.answer("Choose your chat mode:", reply_markup=MODE_SELECT_KB)
+        await cb.message.answer("Choose your chat mode:", reply_markup=_mode_select_kb())
 
 
 @router.callback_query(F.data == "go_profile")
@@ -925,7 +953,7 @@ async def cb_find_stranger(cb: CallbackQuery) -> None:
     if not user.get("g"):
         await cb.message.edit_text("Please set your gender first:", reply_markup=GENDER_SELECT_KB)
         return
-    await cb.message.edit_text("Choose your chat mode:", reply_markup=MODE_SELECT_KB)
+    await cb.message.edit_text("Choose your chat mode:", reply_markup=_mode_select_kb())
 
 
 @router.callback_query(F.data.in_({"ms_normal", "ms_adult"}))
@@ -1654,6 +1682,7 @@ async def main() -> None:
     dp.include_router(router)
     await db.ensure_indexes()
     await dummy_web_server()
+    asyncio.create_task(_refresh_active_counts())
     log.info("Bot starting…")
     await dp.start_polling(
         bot,
