@@ -665,7 +665,7 @@ async def cb_go_profile(cb: CallbackQuery) -> None:
     user = await db.get_user(cb.from_user.id)
     if not user:
         return
-    await _show_profile(cb.message.answer, user)
+    await _show_profile(cb.message.edit_text, user)
 
 
 @router.callback_query(F.data == "gft_cancel")
@@ -680,9 +680,29 @@ async def cb_gift_cancel(cb: CallbackQuery) -> None:
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
+    data = await state.get_data()
+    prompt_msg_id = data.get("prompt_msg_id")
     await state.clear()
+    # Try to delete user's typed message
+    try:
+        await message.delete()
+    except Exception:
+        pass
     if current:
-        await message.answer("❌ Cancelled.", reply_markup=MAIN_MENU_KB)
+        user = await db.get_user(message.from_user.id)
+        streak_line = _streak_line(user) if user else ""
+        alias = user["n"] if user else "—"
+        g = _gender_label(user) if user else ""
+        cancel_text = f"👋 <b>{alias}</b> {g}{streak_line}\n\nReady to chat?"
+        if prompt_msg_id:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id, message_id=prompt_msg_id,
+                    text=cancel_text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU_KB)
+                return
+            except Exception:
+                pass
+        await message.answer(cancel_text, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU_KB)
     else:
         await message.answer("Nothing to cancel.", reply_markup=MAIN_MENU_KB)
 
@@ -717,10 +737,10 @@ async def cmd_profile(message: Message) -> None:
 async def cb_my_profile(cb: CallbackQuery) -> None:
     await cb.answer()
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
-    await _show_profile(cb.message.answer, user)
+    await _show_profile(cb.message.edit_text, user)
 
 
-async def _show_profile(send_fn, user: dict) -> None:
+async def _show_profile(edit_or_send, user: dict) -> None:
     alias   = user.get("n", "—")
     gender  = _gender_label(user)
     tags    = " ".join(f"#{t}" for t in user.get("tags", [])) or "No tags set"
@@ -742,7 +762,7 @@ async def _show_profile(send_fn, user: dict) -> None:
         [InlineKeyboardButton(text="🏷️ Update Tags",    callback_data="my_tags")],
         [InlineKeyboardButton(text="🏠 Main Menu",      callback_data="prof_back")],
     ])
-    await send_fn(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await edit_or_send(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 @router.callback_query(F.data == "prof_back")
@@ -761,7 +781,8 @@ async def cb_prof_back(cb: CallbackQuery) -> None:
 async def cb_prof_alias(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
     await state.set_state(ProfileStates.changing_alias)
-    await cb.message.answer(
+    await state.update_data(prompt_msg_id=cb.message.message_id)
+    await cb.message.edit_text(
         "✏️ Send your <b>new alias</b> (any text).\n\n"
         "Send /cancel to go back.",
         parse_mode=ParseMode.HTML)
@@ -769,14 +790,30 @@ async def cb_prof_alias(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(ProfileStates.changing_alias)
 async def handle_profile_alias(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    prompt_msg_id = data.get("prompt_msg_id")
     await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
     if not message.text or not message.text.strip():
-        await message.answer("⚠️ Please send a non-empty alias.")
+        if prompt_msg_id:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=prompt_msg_id,
+                text="⚠️ Please send a non-empty alias.\n\nSend /cancel to go back.",
+                parse_mode=ParseMode.HTML)
         return
     new_alias = message.text.strip()[:32]
     await db.set_alias(message.from_user.id, new_alias)
     user = await db.get_user(message.from_user.id)
-    await _show_profile(message.answer, user)
+    if prompt_msg_id:
+        await _show_profile(
+            lambda text, **kw: message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=prompt_msg_id, text=text, **kw),
+            user)
+    else:
+        await _show_profile(message.answer, user)
 
 
 @router.callback_query(F.data == "prof_gender")
@@ -789,7 +826,7 @@ async def cb_prof_gender(cb: CallbackQuery) -> None:
         ],
         [InlineKeyboardButton(text="⬅️ Back to Profile", callback_data="go_profile")],
     ])
-    await cb.message.answer("🔄 Select your new gender:", reply_markup=profile_gender_kb)
+    await cb.message.edit_text("🔄 Select your new gender:", reply_markup=profile_gender_kb)
 
 
 # ---------------------------------------------------------------------------
@@ -802,7 +839,8 @@ async def cb_my_tags(cb: CallbackQuery, state: FSMContext) -> None:
     user = await db.get_user(cb.from_user.id)
     current = " ".join(f"#{t}" for t in user.get("tags", [])) if user and user.get("tags") else "none"
     await state.set_state(UserStates.entering_tags)
-    await cb.message.answer(
+    await state.update_data(prompt_msg_id=cb.message.message_id)
+    await cb.message.edit_text(
         f"🏷️ <b>Current tags:</b> {current}\n\n"
         "Send up to <b>3 hashtags</b>:  <code>#gaming #movies #kpop</code>\n\n"
         "Send /cancel to go back.",
@@ -811,21 +849,43 @@ async def cb_my_tags(cb: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(UserStates.entering_tags)
 async def handle_tags_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    prompt_msg_id = data.get("prompt_msg_id")
     await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    async def _edit_prompt(text: str, **kw):
+        if prompt_msg_id:
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=prompt_msg_id, text=text, **kw)
+        else:
+            await message.answer(text, **kw)
+
     if not message.text:
-        await message.answer("⚠️ Please send hashtags as text.")
+        await _edit_prompt("⚠️ Please send hashtags as text.\n\nSend /cancel to go back.")
         return
     raw = [t.lstrip("#").lower().strip()
            for t in message.text.split() if t.startswith("#") and len(t) > 1]
     if not raw:
-        await message.answer("⚠️ No valid hashtags. Format: <code>#gaming #movies</code>",
-                             parse_mode=ParseMode.HTML)
+        await _edit_prompt(
+            "⚠️ No valid hashtags. Format: <code>#gaming #movies</code>\n\n"
+            "Send /cancel to go back.", parse_mode=ParseMode.HTML)
         return
     tags = list(dict.fromkeys(raw))[:3]
     await db.set_tags(message.from_user.id, tags)
-    await message.answer(
-        f"✅ Tags saved: <b>{' '.join('#' + t for t in tags)}</b>",
-        parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU_KB)
+    user = await db.get_user(message.from_user.id)
+    if prompt_msg_id:
+        await _show_profile(
+            lambda text, **kw: message.bot.edit_message_text(
+                chat_id=message.chat.id, message_id=prompt_msg_id, text=text, **kw),
+            user)
+    else:
+        await message.answer(
+            f"✅ Tags saved: <b>{' '.join('#' + t for t in tags)}</b>",
+            parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU_KB)
 
 
 @router.message(Command("tags"))
@@ -849,16 +909,23 @@ async def cb_find_stranger(cb: CallbackQuery) -> None:
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
     active = await db.lift_expired_temp_ban(cb.from_user.id)
     if not active:
-        await cb.message.answer("🚫 You are banned and cannot use this feature.")
+        await cb.message.edit_text("🚫 You are banned and cannot use this feature.",
+                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                       InlineKeyboardButton(text="⬅️ Back", callback_data="go_main_menu")
+                                   ]]))
         return
     if user.get("p_id"):
-        await cb.message.answer("You are already in a chat. Use <b>🔚 Stop Chat</b> first.",
-                                parse_mode=ParseMode.HTML, reply_markup=STRANGER_KB)
+        await cb.message.edit_text(
+            "You are already in a chat. Use <b>🔚 Stop Chat</b> first.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ Back", callback_data="go_main_menu")
+            ]]))
         return
     if not user.get("g"):
-        await cb.message.answer("Please set your gender first:", reply_markup=GENDER_SELECT_KB)
+        await cb.message.edit_text("Please set your gender first:", reply_markup=GENDER_SELECT_KB)
         return
-    await cb.message.answer("Choose your chat mode:", reply_markup=MODE_SELECT_KB)
+    await cb.message.edit_text("Choose your chat mode:", reply_markup=MODE_SELECT_KB)
 
 
 @router.callback_query(F.data.in_({"ms_normal", "ms_adult"}))
@@ -872,7 +939,7 @@ async def cb_mode_select(cb: CallbackQuery) -> None:
     tag_hint = (f"\n🏷️ Tags: {' '.join('#' + t for t in tags)}"
                 if tags else "\n💡 Tip: /tags to find like-minded strangers!")
     label = "Normal Mode 🌐" if mode == "normal" else "18+ Adult Mode 🔥"
-    await cb.message.answer(
+    await cb.message.edit_text(
         f"✅ <b>{label}</b> selected.{tag_hint}\n\nWho would you like to chat with?",
         parse_mode=ParseMode.HTML,
         reply_markup=_target_gender_kb(mode))
@@ -886,11 +953,16 @@ async def cb_find_with_mode(cb: CallbackQuery) -> None:
     target_gender = {"any": "any", "m": "M", "f": "F"}[tg_code]
     user = await db.get_or_create_user(cb.from_user.id, cb.from_user.username)
     if user.get("p_id"):
-        await cb.message.answer("You are already in a chat.", reply_markup=STRANGER_KB)
+        await cb.message.edit_text(
+            "You are already in a chat.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ Back", callback_data="go_main_menu")
+            ]]))
         return
     labels = {"any": "Anyone 🌐", "M": "Boys 👦", "F": "Girls 👧"}
-    await cb.message.answer(f"✅ Looking for: <b>{labels[target_gender]}</b>",
-                            parse_mode=ParseMode.HTML)
+    await cb.message.edit_text(
+        f"🔍 Looking for: <b>{labels[target_gender]}</b>…",
+        parse_mode=ParseMode.HTML)
     await _do_find(cb.bot, cb.from_user.id, target_gender, mode)
 
 
