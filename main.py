@@ -122,6 +122,7 @@ GIFT_KB = InlineKeyboardMarkup(inline_keyboard=[
         InlineKeyboardButton(text="✨ Magic Star",  callback_data="gft_8"),
         InlineKeyboardButton(text="🎉 Party Popper",callback_data="gft_9"),
     ],
+    [InlineKeyboardButton(text="❌ Cancel",        callback_data="gft_cancel")],
 ])
 
 # ---------------------------------------------------------------------------
@@ -137,13 +138,15 @@ MAIN_MENU_KB = InlineKeyboardMarkup(inline_keyboard=[
 MODE_SELECT_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Normal Mode 🌐",    callback_data="ms_normal")],
     [InlineKeyboardButton(text="18+ Adult Mode 🔥", callback_data="ms_adult")],
+    [InlineKeyboardButton(text="⬅️ Back",           callback_data="go_main_menu")],
 ])
 
 GENDER_SELECT_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text="Male 👦",   callback_data="gender_m"),
         InlineKeyboardButton(text="Female 👧", callback_data="gender_f"),
-    ]
+    ],
+    [InlineKeyboardButton(text="⬅️ Back",    callback_data="go_main_menu")],
 ])
 
 
@@ -156,6 +159,7 @@ def _target_gender_kb(mode: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Find Boys 👦",  callback_data=f"find_{m}_m"),
             InlineKeyboardButton(text="Find Girls 👧", callback_data=f"find_{m}_f"),
         ],
+        [InlineKeyboardButton(text="⬅️ Back",      callback_data="go_mode_select")],
     ])
 
 
@@ -624,6 +628,66 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Global navigation callbacks — back buttons used across all screens
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "go_main_menu")
+async def cb_go_main_menu(cb: CallbackQuery, state: FSMContext) -> None:
+    await cb.answer()
+    await state.clear()
+    user = await db.get_user(cb.from_user.id)
+    if not user:
+        await cb.message.edit_text("👋 Ready to chat?", reply_markup=MAIN_MENU_KB)
+        return
+    streak_line = _streak_line(user)
+    try:
+        await cb.message.edit_text(
+            f"👋 <b>{user['n']}</b> {_gender_label(user)}{streak_line}\n\nReady to chat?",
+            parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU_KB)
+    except Exception:
+        await cb.message.answer(
+            f"👋 <b>{user['n']}</b> {_gender_label(user)}{streak_line}\n\nReady to chat?",
+            parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU_KB)
+
+
+@router.callback_query(F.data == "go_mode_select")
+async def cb_go_mode_select(cb: CallbackQuery) -> None:
+    await cb.answer()
+    try:
+        await cb.message.edit_text("Choose your chat mode:", reply_markup=MODE_SELECT_KB)
+    except Exception:
+        await cb.message.answer("Choose your chat mode:", reply_markup=MODE_SELECT_KB)
+
+
+@router.callback_query(F.data == "go_profile")
+async def cb_go_profile(cb: CallbackQuery) -> None:
+    await cb.answer()
+    user = await db.get_user(cb.from_user.id)
+    if not user:
+        return
+    await _show_profile(cb.message.answer, user)
+
+
+@router.callback_query(F.data == "gft_cancel")
+async def cb_gift_cancel(cb: CallbackQuery) -> None:
+    await cb.answer("Cancelled.")
+    try:
+        await cb.message.delete()
+    except Exception:
+        await cb.message.edit_text("🎁 Gift cancelled.")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    await state.clear()
+    if current:
+        await message.answer("❌ Cancelled.", reply_markup=MAIN_MENU_KB)
+    else:
+        await message.answer("Nothing to cancel.", reply_markup=MAIN_MENU_KB)
+
+
+# ---------------------------------------------------------------------------
 # Gender selection
 # ---------------------------------------------------------------------------
 
@@ -697,7 +761,10 @@ async def cb_prof_back(cb: CallbackQuery) -> None:
 async def cb_prof_alias(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
     await state.set_state(ProfileStates.changing_alias)
-    await cb.message.answer("✏️ Send your <b>new alias</b> (any text):", parse_mode=ParseMode.HTML)
+    await cb.message.answer(
+        "✏️ Send your <b>new alias</b> (any text).\n\n"
+        "Send /cancel to go back.",
+        parse_mode=ParseMode.HTML)
 
 
 @router.message(ProfileStates.changing_alias)
@@ -715,7 +782,14 @@ async def handle_profile_alias(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "prof_gender")
 async def cb_prof_gender(cb: CallbackQuery) -> None:
     await cb.answer()
-    await cb.message.answer("🔄 Select your new gender:", reply_markup=GENDER_SELECT_KB)
+    profile_gender_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Male 👦",   callback_data="gender_m"),
+            InlineKeyboardButton(text="Female 👧", callback_data="gender_f"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Back to Profile", callback_data="go_profile")],
+    ])
+    await cb.message.answer("🔄 Select your new gender:", reply_markup=profile_gender_kb)
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +804,8 @@ async def cb_my_tags(cb: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(UserStates.entering_tags)
     await cb.message.answer(
         f"🏷️ <b>Current tags:</b> {current}\n\n"
-        "Send up to <b>3 hashtags</b>:  <code>#gaming #movies #kpop</code>",
+        "Send up to <b>3 hashtags</b>:  <code>#gaming #movies #kpop</code>\n\n"
+        "Send /cancel to go back.",
         parse_mode=ParseMode.HTML)
 
 
