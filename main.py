@@ -374,20 +374,27 @@ async def _bulk_delete_chat(
     """
     Range-delete all bot messages in [start_msg_id, end_msg_id] from a user's chat.
 
-    Uses batched asyncio.gather (25 at a time) to stay within Telegram rate limits.
-    Messages the bot never sent (user's own messages, already-deleted messages) are
-    skipped silently — the try/except inside _try_delete handles every exception.
+    Uses Telegram's native deleteMessages batch API (up to 100 IDs per call),
+    which is ~100x faster than one-by-one deletion and far less likely to hit
+    rate limits.  Any IDs the bot never sent (user's own messages, already-
+    deleted messages) are silently ignored by Telegram — no extra error handling
+    needed beyond the outer try/except.
     """
     if not start_msg_id or not end_msg_id or end_msg_id < start_msg_id:
         return
     all_ids = list(range(start_msg_id, end_msg_id + 1))
-    BATCH = 25
+    BATCH = 100  # Telegram deleteMessages maximum
     for i in range(0, len(all_ids), BATCH):
         batch = all_ids[i : i + BATCH]
-        await asyncio.gather(
-            *[_try_delete(bot, user_id, mid) for mid in batch],
-            return_exceptions=True,
-        )
+        try:
+            await bot.delete_messages(chat_id=user_id, message_ids=batch)
+        except Exception:
+            # Batch failed (e.g. all messages already deleted) — fall back to
+            # individual deletes so we don't silently miss partial success.
+            await asyncio.gather(
+                *[_try_delete(bot, user_id, mid) for mid in batch],
+                return_exceptions=True,
+            )
 
 
 async def _bg_update_last(user_id: int, msg_id: int) -> None:
