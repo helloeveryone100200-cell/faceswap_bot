@@ -1,5 +1,5 @@
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -21,7 +21,7 @@ def get_db():
 
 
 # ---------------------------------------------------------------------------
-# Indexes — call once at startup
+# Indexes
 # ---------------------------------------------------------------------------
 
 async def ensure_indexes() -> None:
@@ -54,12 +54,16 @@ async def get_or_create_user(user_id: int, username: str | None) -> dict:
         "_id": user_id,
         "u": username,
         "n": alias,
-        "g": None,           # gender: "M" | "F" | None
-        "tags": [],          # interests: up to 3 strings (without #)
-        "p_id": None,        # stranger partner ID
-        "s": 1,              # status: 1=active, 0=banned
-        "ban_exp": None,     # temp ban expiry datetime
-        "report_count": 0,   # number of reports received
+        "g": None,
+        "tags": [],
+        "p_id": None,
+        "chat_mode": None,
+        "s": 1,
+        "ban_exp": None,
+        "report_count": 0,
+        "karma_points": 0,
+        "streak": 0,
+        "streak_date": None,
         "j": datetime.now(timezone.utc),
     }
     await db["u"].insert_one(user)
@@ -75,8 +79,45 @@ async def set_tags(user_id: int, tags: list[str]) -> None:
 
 
 async def set_alias(user_id: int, alias: str) -> None:
-    """Admin: force-change a user's display alias."""
     await get_db()["u"].update_one({"_id": user_id}, {"$set": {"n": alias}})
+
+
+async def set_chat_mode(user_id: int, mode: str | None) -> None:
+    await get_db()["u"].update_one({"_id": user_id}, {"$set": {"chat_mode": mode}})
+
+
+async def add_karma(user_id: int) -> int:
+    result = await get_db()["u"].find_one_and_update(
+        {"_id": user_id},
+        {"$inc": {"karma_points": 1}},
+        return_document=True,
+    )
+    return result["karma_points"] if result else 0
+
+
+async def update_streak(user_id: int) -> int:
+    """Increment or reset daily streak. Returns new streak count."""
+    db = get_db()
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    user = await db["u"].find_one({"_id": user_id})
+    if not user:
+        return 0
+    last_date = user.get("streak_date")
+    streak = user.get("streak", 0)
+
+    if last_date == today:
+        return streak
+    elif last_date == yesterday:
+        streak += 1
+    else:
+        streak = 1
+
+    await db["u"].update_one(
+        {"_id": user_id},
+        {"$set": {"streak": streak, "streak_date": today}}
+    )
+    return streak
 
 
 async def ban_user(user_id: int) -> None:
@@ -121,6 +162,11 @@ async def count_active_chatters() -> int:
     return await get_db()["u"].count_documents({"p_id": {"$ne": None}, "s": 1})
 
 
+async def count_temp_banned() -> int:
+    now = datetime.now(timezone.utc)
+    return await get_db()["u"].count_documents({"s": 0, "ban_exp": {"$gt": now}})
+
+
 async def get_all_active_users() -> list[dict]:
     cursor = get_db()["u"].find({"s": 1})
     return await cursor.to_list(length=None)
@@ -134,7 +180,6 @@ USERS_PER_PAGE = 5
 
 
 async def get_users_paginated(page: int) -> tuple[list[dict], int]:
-    """Return (users_on_page, total_count) sorted newest first."""
     db = get_db()
     total = await db["u"].count_documents({})
     cursor = db["u"].find().sort("j", -1).skip(page * USERS_PER_PAGE).limit(USERS_PER_PAGE)
@@ -143,7 +188,6 @@ async def get_users_paginated(page: int) -> tuple[list[dict], int]:
 
 
 async def search_users(query: str) -> list[dict]:
-    """Search by numeric Telegram ID or by @username substring (case-insensitive)."""
     db = get_db()
     if query.lstrip("-").isdigit():
         user = await db["u"].find_one({"_id": int(query)})
@@ -179,7 +223,6 @@ async def add_report(reporter_id: int, reported_id: int) -> int:
 
 
 async def get_reports_paginated(page: int) -> tuple[list[dict], int]:
-    """Return (reports_on_page, total_count) sorted newest first."""
     db = get_db()
     total = await db["reports"].count_documents({})
     cursor = db["reports"].find().sort("t", -1).skip(page * REPORTS_PER_PAGE).limit(REPORTS_PER_PAGE)
@@ -188,12 +231,10 @@ async def get_reports_paginated(page: int) -> tuple[list[dict], int]:
 
 
 async def dismiss_report(report_id_str: str) -> None:
-    """Delete a single report document by its ObjectId string."""
     await get_db()["reports"].delete_one({"_id": ObjectId(report_id_str)})
 
 
 async def clear_user_reports(user_id: int) -> None:
-    """Delete all reports against a user and reset their report_count."""
     await get_db()["reports"].delete_many({"reported": user_id})
     await get_db()["u"].update_one({"_id": user_id}, {"$set": {"report_count": 0}})
 
@@ -203,7 +244,7 @@ async def count_reports_total() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Match logging  (collection: 'matches')
+# Match logging
 # ---------------------------------------------------------------------------
 
 async def log_match(user_a_id: int, user_b_id: int) -> None:
@@ -218,7 +259,7 @@ async def count_matches_total() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Advanced Stats helpers
+# Advanced Stats
 # ---------------------------------------------------------------------------
 
 def _today_start() -> datetime:
@@ -238,16 +279,8 @@ async def count_reports_today() -> int:
     return await get_db()["reports"].count_documents({"t": {"$gte": _today_start()}})
 
 
-async def count_temp_banned() -> int:
-    now = datetime.now(timezone.utc)
-    return await get_db()["u"].count_documents({
-        "s": 0,
-        "ban_exp": {"$gt": now},
-    })
-
-
 # ---------------------------------------------------------------------------
-# Stranger queue helpers  (collection: 'q')
+# Stranger queue  (collection: 'q')
 # ---------------------------------------------------------------------------
 
 async def enter_queue(
@@ -255,6 +288,8 @@ async def enter_queue(
     gender: str | None,
     target_gender: str,
     tags: list[str],
+    mode: str = "normal",
+    karma: int = 0,
 ) -> None:
     await get_db()["q"].update_one(
         {"_id": user_id},
@@ -263,6 +298,8 @@ async def enter_queue(
             "g": gender,
             "tg": target_gender,
             "tags": tags,
+            "mode": mode,
+            "karma": karma,
         }},
         upsert=True,
     )
@@ -285,12 +322,14 @@ async def find_and_match(
     user_gender: str | None,
     target_gender: str,
     user_tags: list[str],
+    mode: str = "normal",
+    user_karma: int = 0,
     strict: bool = True,
 ) -> int | None:
     db = get_db()
 
-    def _gender_query() -> dict:
-        q: dict = {"_id": {"$ne": user_id}}
+    def _base_q() -> dict:
+        q: dict = {"_id": {"$ne": user_id}, "mode": mode}
         if target_gender != "any":
             q["g"] = target_gender
         if user_gender:
@@ -300,20 +339,29 @@ async def find_and_match(
         return q
 
     if strict and user_tags:
-        tag_q = _gender_query()
-        tag_q["tags"] = {"$in": user_tags}
-        match = await db["q"].find_one_and_delete(tag_q)
+        # Prefer high-karma users with shared tags
+        q = _base_q()
+        q["tags"] = {"$in": user_tags}
+        q["karma"] = {"$gte": max(0, user_karma - 5)}
+        match = await db["q"].find_one_and_delete(q)
+        if match:
+            return match["_id"]
+        # Any karma, with tags
+        q2 = _base_q()
+        q2["tags"] = {"$in": user_tags}
+        match = await db["q"].find_one_and_delete(q2)
         if match:
             return match["_id"]
 
-    gender_q = _gender_query()
-    match = await db["q"].find_one_and_delete(gender_q)
+    # Gender + mode match, any tags
+    match = await db["q"].find_one_and_delete(_base_q())
     if match:
         return match["_id"]
 
     if not strict:
-        any_match = await db["q"].find_one_and_delete({"_id": {"$ne": user_id}})
-        return any_match["_id"] if any_match else None
+        any_q = {"_id": {"$ne": user_id}, "mode": mode}
+        match = await db["q"].find_one_and_delete(any_q)
+        return match["_id"] if match else None
 
     return None
 
